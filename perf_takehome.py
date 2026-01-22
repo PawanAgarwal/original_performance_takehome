@@ -292,17 +292,24 @@ class KernelBuilder:
         # ALL tree values for scatter rounds - 32 vectors × 8 elements = 256 words
         all_tree = self.alloc_scratch("all_tree", batch_size)
 
-        # Allocate 8 address registers per vector group for parallel scatter
-        # With 4 groups × 8 addresses = 32 address registers, we can overlap
-        # address calculation for multiple vector groups
+        # Allocate address registers for pipelined scatter
+        # Each quad needs 32 addresses (4 vectors × 8 elements)
+        # For triple pipelining, we need 2 sets of 32 = 64 addresses
+        # Set A (banks 0-3) for even quads (0, 2, 4, 6)
+        # Set B (banks 4-7) for odd quads (1, 3, 5, 7)
         addrs = [addr0, addr1]
         for i in range(2, 8):
             addrs.append(self.alloc_scratch(f"addr{i}"))
-        # Additional address register banks for pipelining
         addrs_bank1 = [self.alloc_scratch(f"addr1_{i}") for i in range(8)]
         addrs_bank2 = [self.alloc_scratch(f"addr2_{i}") for i in range(8)]
         addrs_bank3 = [self.alloc_scratch(f"addr3_{i}") for i in range(8)]
-        addr_banks = [addrs, addrs_bank1, addrs_bank2, addrs_bank3]
+        # Second set for double buffering
+        addrs_bank4 = [self.alloc_scratch(f"addr4_{i}") for i in range(8)]
+        addrs_bank5 = [self.alloc_scratch(f"addr5_{i}") for i in range(8)]
+        addrs_bank6 = [self.alloc_scratch(f"addr6_{i}") for i in range(8)]
+        addrs_bank7 = [self.alloc_scratch(f"addr7_{i}") for i in range(8)]
+        addr_banks_even = [addrs, addrs_bank1, addrs_bank2, addrs_bank3]  # for quads 0,2,4,6
+        addr_banks_odd = [addrs_bank4, addrs_bank5, addrs_bank6, addrs_bank7]  # for quads 1,3,5,7
 
         # Setup broadcasts
         slots.append(("valu", ("vbroadcast", v_zero, zero_const)))
@@ -575,76 +582,113 @@ class KernelBuilder:
             slots.append(("valu", ("*", vi1, vi1, v_tmp4)))
 
         def emit_scatter_round():
-            """Generate one round of scatter with fine-grained interleaving.
+            """Generate one round of scatter with triple-pipelining.
 
-            Separate addr ops from loads, then interleave loads with compute.
+            Pipeline: addr[q] | load[q-1] | compute[q-2]
+            Even quads use addr_banks_even, odd quads use addr_banks_odd.
+            This allows addr[q] and load[q-1] to use different bank sets.
             """
             nonlocal slots
 
-            # Collect operations
-            all_addr_ops = []
-            all_load_ops = []
-            all_compute_ops = []
-
+            # Collect operations per quad
             n_quads = n_vecs // 4
+            quad_addr_ops = []  # quad_addr_ops[q] = list of addr ops for quad q
+            quad_load_ops = []  # quad_load_ops[q] = list of load ops for quad q
+            quad_compute_ops = []  # quad_compute_ops[q] = list of compute ops for quad q
 
-            for v in range(n_vecs):
-                bank = addr_banks[v % 4]
-                vi = all_idx + v * VLEN
-                tree_dest = all_tree + v * VLEN
-                for i in range(8):
-                    all_addr_ops.append(("alu", ("+", bank[i], self.scratch["forest_values_p"], vi + i)))
-                for i in range(8):
-                    all_load_ops.append(("load", ("load", tree_dest + i, bank[i])))
+            for q in range(n_quads):
+                addr_ops = []
+                load_ops = []
+                v_start = q * 4
+                # Use even/odd bank sets to allow pipelining
+                banks = addr_banks_even if (q % 2) == 0 else addr_banks_odd
+                for v_offset in range(4):
+                    v = v_start + v_offset
+                    bank = banks[v_offset]  # Each vector in quad uses different bank
+                    vi = all_idx + v * VLEN
+                    tree_dest = all_tree + v * VLEN
+                    for i in range(8):
+                        addr_ops.append(("alu", ("+", bank[i], self.scratch["forest_values_p"], vi + i)))
+                    for i in range(8):
+                        load_ops.append(("load", ("load", tree_dest + i, bank[i])))
+                quad_addr_ops.append(addr_ops)
+                quad_load_ops.append(load_ops)
 
             for q in range(n_quads):
                 v_start = q * 4
+                compute_ops = []
                 vi0, vv0, tv0 = all_idx + v_start * VLEN, all_val + v_start * VLEN, all_tree + v_start * VLEN
                 vi1, vv1, tv1 = all_idx + (v_start+1) * VLEN, all_val + (v_start+1) * VLEN, all_tree + (v_start+1) * VLEN
                 vi2, vv2, tv2 = all_idx + (v_start+2) * VLEN, all_val + (v_start+2) * VLEN, all_tree + (v_start+2) * VLEN
                 vi3, vv3, tv3 = all_idx + (v_start+3) * VLEN, all_val + (v_start+3) * VLEN, all_tree + (v_start+3) * VLEN
-                all_compute_ops.append(("valu", ("^", vv0, vv0, tv0)))
-                all_compute_ops.append(("valu", ("^", vv1, vv1, tv1)))
-                all_compute_ops.append(("valu", ("^", vv2, vv2, tv2)))
-                all_compute_ops.append(("valu", ("^", vv3, vv3, tv3)))
-                emit_hash_quad(vv0, vv1, vv2, vv3, target=all_compute_ops)
-                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=all_compute_ops)
+                compute_ops.append(("valu", ("^", vv0, vv0, tv0)))
+                compute_ops.append(("valu", ("^", vv1, vv1, tv1)))
+                compute_ops.append(("valu", ("^", vv2, vv2, tv2)))
+                compute_ops.append(("valu", ("^", vv3, vv3, tv3)))
+                emit_hash_quad(vv0, vv1, vv2, vv3, target=compute_ops)
+                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=compute_ops)
+                quad_compute_ops.append(compute_ops)
 
-            ops_per_quad_addr = 32
-            ops_per_quad_load = 32
-            ops_per_quad_compute = len(all_compute_ops) // n_quads
+            # Triple pipeline: addr[q] | load[q-1] | compute[q-2]
+            # Phase 0: addr[0]
+            for op in quad_addr_ops[0]:
+                slots.append(op)
 
-            # First quad: emit all addr, then all loads
-            for i in range(ops_per_quad_addr):
-                slots.append(all_addr_ops[i])
-            for i in range(ops_per_quad_load):
-                slots.append(all_load_ops[i])
+            # Phase 1: interleave addr[1] with load[0]
+            ai, li = 0, 0
+            while ai < len(quad_addr_ops[1]) or li < len(quad_load_ops[0]):
+                # Emit addr ops (up to 12 per cycle, but we have 32, so ~3 cycles)
+                for _ in range(12):
+                    if ai < len(quad_addr_ops[1]):
+                        slots.append(quad_addr_ops[1][ai])
+                        ai += 1
+                # Emit load ops (2 per cycle)
+                for _ in range(2):
+                    if li < len(quad_load_ops[0]):
+                        slots.append(quad_load_ops[0][li])
+                        li += 1
 
-            # For each subsequent quad: addr, then interleave loads with prev compute
-            for q in range(1, n_quads):
-                addr_start = q * ops_per_quad_addr
-                for i in range(ops_per_quad_addr):
-                    slots.append(all_addr_ops[addr_start + i])
-
-                load_start = q * ops_per_quad_load
-                compute_start = (q - 1) * ops_per_quad_compute
-
-                li = 0
-                ci = 0
-                while li < ops_per_quad_load or ci < ops_per_quad_compute:
+            # Phases 2 to n_quads-1: interleave addr[q], load[q-1], compute[q-2]
+            for q in range(2, n_quads):
+                ai, li, ci = 0, 0, 0
+                addr_ops = quad_addr_ops[q]
+                load_ops = quad_load_ops[q-1]
+                compute_ops = quad_compute_ops[q-2]
+                # Interleave all three - addr uses ALU, load uses load slots, compute uses valu
+                while ai < len(addr_ops) or li < len(load_ops) or ci < len(compute_ops):
+                    # Emit addr ops (batch of up to 12)
+                    for _ in range(12):
+                        if ai < len(addr_ops):
+                            slots.append(addr_ops[ai])
+                            ai += 1
+                    # Emit load ops (2 per cycle)
                     for _ in range(2):
-                        if li < ops_per_quad_load:
-                            slots.append(all_load_ops[load_start + li])
+                        if li < len(load_ops):
+                            slots.append(load_ops[li])
                             li += 1
+                    # Emit compute ops (6 per cycle)
                     for _ in range(6):
-                        if ci < ops_per_quad_compute:
-                            slots.append(all_compute_ops[compute_start + ci])
+                        if ci < len(compute_ops):
+                            slots.append(compute_ops[ci])
                             ci += 1
 
-            # Final quad: just compute
-            compute_start = (n_quads - 1) * ops_per_quad_compute
-            for i in range(ops_per_quad_compute):
-                slots.append(all_compute_ops[compute_start + i])
+            # Phase n_quads: load[n_quads-1] interleaved with compute[n_quads-2]
+            li, ci = 0, 0
+            load_ops = quad_load_ops[n_quads-1]
+            compute_ops = quad_compute_ops[n_quads-2]
+            while li < len(load_ops) or ci < len(compute_ops):
+                for _ in range(2):
+                    if li < len(load_ops):
+                        slots.append(load_ops[li])
+                        li += 1
+                for _ in range(6):
+                    if ci < len(compute_ops):
+                        slots.append(compute_ops[ci])
+                        ci += 1
+
+            # Final phase: compute[n_quads-1]
+            for op in quad_compute_ops[n_quads-1]:
+                slots.append(op)
 
         def emit_broadcast_round():
             """Round where all idx=0, use broadcast with multiply_add optimization."""
