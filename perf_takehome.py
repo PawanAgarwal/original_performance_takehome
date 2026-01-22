@@ -378,7 +378,7 @@ class KernelBuilder:
                     target.append(("valu", (op2, vv3, v_tmp7, v_tmp8)))
 
         # Helper: emit index update for 4 vectors (quad) using multiply_add
-        def emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=None):
+        def emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=None, check_wrap=True):
             if target is None:
                 target = slots
             # bit = hash % 2
@@ -397,16 +397,19 @@ class KernelBuilder:
             target.append(("valu", ("multiply_add", vi2, vi2, v_two, v_tmp3)))
             target.append(("valu", ("multiply_add", vi3, vi3, v_two, v_tmp4)))
             # cmp = idx < n_nodes; idx = idx * cmp (wrapping)
-            target.append(("valu", ("<", v_tmp1, vi0, v_n_nodes)))
-            target.append(("valu", ("<", v_tmp2, vi1, v_n_nodes)))
-            target.append(("valu", ("<", v_tmp3, vi2, v_n_nodes)))
-            target.append(("valu", ("<", v_tmp4, vi3, v_n_nodes)))
-            target.append(("valu", ("*", vi0, vi0, v_tmp1)))
-            target.append(("valu", ("*", vi1, vi1, v_tmp2)))
-            target.append(("valu", ("*", vi2, vi2, v_tmp3)))
-            target.append(("valu", ("*", vi3, vi3, v_tmp4)))
+            # Only check wrapping if needed - most rounds don't need it
+            if check_wrap:
+                target.append(("valu", ("<", v_tmp1, vi0, v_n_nodes)))
+                target.append(("valu", ("<", v_tmp2, vi1, v_n_nodes)))
+                target.append(("valu", ("<", v_tmp3, vi2, v_n_nodes)))
+                target.append(("valu", ("<", v_tmp4, vi3, v_n_nodes)))
+                target.append(("valu", ("*", vi0, vi0, v_tmp1)))
+                target.append(("valu", ("*", vi1, vi1, v_tmp2)))
+                target.append(("valu", ("*", vi2, vi2, v_tmp3)))
+                target.append(("valu", ("*", vi3, vi3, v_tmp4)))
 
         # Process 4 vectors (quad) at a time for round 0
+        # No wrap check needed - idx goes from 0 to {1,2}
         for v in range(0, n_vecs, 4):
             vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
             vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
@@ -417,7 +420,7 @@ class KernelBuilder:
             slots.append(("valu", ("^", vv2, vv2, v_node_val)))
             slots.append(("valu", ("^", vv3, vv3, v_node_val)))
             emit_hash_quad(vv0, vv1, vv2, vv3)
-            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, check_wrap=False)
 
         self.instrs.extend(self.build(slots))
         slots = []
@@ -465,7 +468,8 @@ class KernelBuilder:
             slots.append(("valu", ("^", vv2, vv2, v_nv2)))
             slots.append(("valu", ("^", vv3, vv3, v_nv3)))
             emit_hash_quad(vv0, vv1, vv2, vv3)
-            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+            # No wrap check - idx goes from {1,2} to {3,4,5,6}
+            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, check_wrap=False)
 
         self.instrs.extend(self.build(slots))
         slots = []
@@ -539,7 +543,8 @@ class KernelBuilder:
             slots.append(("valu", ("^", vv3, vv3, v_nv3)))
             # Hash and idx update with multiply_add
             emit_hash_quad(vv0, vv1, vv2, vv3)
-            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+            # No wrap check - idx goes from {3-6} to {7-14}
+            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, check_wrap=False)
 
         self.instrs.extend(self.build(slots))
         slots = []
@@ -581,12 +586,14 @@ class KernelBuilder:
             slots.append(("valu", ("*", vi0, vi0, v_tmp1)))
             slots.append(("valu", ("*", vi1, vi1, v_tmp4)))
 
-        def emit_scatter_round():
+        def emit_scatter_round(check_wrap=True):
             """Generate one round of scatter with triple-pipelining.
 
             Pipeline: addr[q] | load[q-1] | compute[q-2]
             Even quads use addr_banks_even, odd quads use addr_banks_odd.
             This allows addr[q] and load[q-1] to use different bank sets.
+
+            check_wrap: if False, skip the idx < n_nodes check (safe for most rounds)
             """
             nonlocal slots
 
@@ -626,7 +633,7 @@ class KernelBuilder:
                 compute_ops.append(("valu", ("^", vv2, vv2, tv2)))
                 compute_ops.append(("valu", ("^", vv3, vv3, tv3)))
                 emit_hash_quad(vv0, vv1, vv2, vv3, target=compute_ops)
-                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=compute_ops)
+                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=compute_ops, check_wrap=check_wrap)
                 quad_compute_ops.append(compute_ops)
 
             # Optimized pipelining: emit operations in ideal cycle-sized chunks
@@ -712,7 +719,7 @@ class KernelBuilder:
                 slots.append(("valu", ("^", vv2, vv2, v_node_val)))
                 slots.append(("valu", ("^", vv3, vv3, v_node_val)))
                 emit_hash_quad(vv0, vv1, vv2, vv3)
-                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, check_wrap=False)
 
         def emit_arith_round():
             """Round where idx in {1,2}, use arithmetic with multiply_add."""
@@ -748,7 +755,7 @@ class KernelBuilder:
                 slots.append(("valu", ("^", vv2, vv2, v_nv2)))
                 slots.append(("valu", ("^", vv3, vv3, v_nv3)))
                 emit_hash_quad(vv0, vv1, vv2, vv3)
-                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, check_wrap=False)
 
         def emit_vselect_round():
             """Round where idx in {3-6}, use vselect with multiply_add for hash."""
@@ -781,40 +788,38 @@ class KernelBuilder:
                 slots.append(("valu", ("^", vv3, vv3, v_nv3)))
                 # Hash and idx update with multiply_add
                 emit_hash_quad(vv0, vv1, vv2, vv3)
-                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, check_wrap=False)
 
         # Trace: scatter start
         slots.append(("load", ("const", trace_marker, TRACE_SCATTER_START)))
         slots.append(("flow", ("trace_write", trace_marker)))
 
-        # Rounds 3-10: scatter (8 rounds) - emit together for better packing
-        for rnd in range(3, 11):
+        # Emit ALL scatter-section rounds together for global scheduling
+        # Rounds 3-9: scatter (no wrap check needed, idx < n_nodes)
+        for rnd in range(3, 10):
             if rnd < rounds:
-                emit_scatter_round()
-        self.instrs.extend(self.build(slots))
-        slots = []
+                emit_scatter_round(check_wrap=False)
+        # Round 10: scatter WITH wrap check (first round where idx >= n_nodes possible)
+        if 10 < rounds:
+            emit_scatter_round(check_wrap=True)
 
         # Round 11: broadcast (all idx wrapped to 0)
         if 11 < rounds:
             emit_broadcast_round()
-            self.instrs.extend(self.build(slots))
-            slots = []
 
         # Round 12: arithmetic (idx in {1,2})
         if 12 < rounds:
             emit_arith_round()
-            self.instrs.extend(self.build(slots))
-            slots = []
 
         # Round 13: vselect (idx in {3-6})
         if 13 < rounds:
             emit_vselect_round()
-            self.instrs.extend(self.build(slots))
-            slots = []
 
-        # Rounds 14-15: scatter - emit together
+        # Rounds 14-15: scatter (no wrap check needed, idx restarts from 0 after wrap)
         for rnd in range(14, rounds):
-            emit_scatter_round()
+            emit_scatter_round(check_wrap=False)
+
+        # Build everything together
         self.instrs.extend(self.build(slots))
         slots = []
 
