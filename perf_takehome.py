@@ -236,6 +236,17 @@ class KernelBuilder:
 
         self.add("flow", ("pause",))
 
+        # Trace marker constants for timing analysis
+        trace_marker = self.alloc_scratch("trace_marker")
+        TRACE_INIT_DONE = 1
+        TRACE_ROUND0_DONE = 2
+        TRACE_ROUND1_DONE = 3
+        TRACE_ROUND2_DONE = 4
+        TRACE_SCATTER_START = 5
+        TRACE_SCATTER_DONE = 6
+        TRACE_STORE_START = 7
+        TRACE_ALL_DONE = 8
+
         # Allocate vector temps - need more for 4-vector processing
         v_node_val = self.alloc_scratch("v_node_val", VLEN)  # tree vals for vec 0
         v_nv1 = self.alloc_scratch("v_nv1", VLEN)            # tree vals for vec 1
@@ -281,10 +292,17 @@ class KernelBuilder:
         # ALL tree values for scatter rounds - 32 vectors × 8 elements = 256 words
         all_tree = self.alloc_scratch("all_tree", batch_size)
 
-        # Allocate 8 address registers for parallel scatter
+        # Allocate 8 address registers per vector group for parallel scatter
+        # With 4 groups × 8 addresses = 32 address registers, we can overlap
+        # address calculation for multiple vector groups
         addrs = [addr0, addr1]
         for i in range(2, 8):
             addrs.append(self.alloc_scratch(f"addr{i}"))
+        # Additional address register banks for pipelining
+        addrs_bank1 = [self.alloc_scratch(f"addr1_{i}") for i in range(8)]
+        addrs_bank2 = [self.alloc_scratch(f"addr2_{i}") for i in range(8)]
+        addrs_bank3 = [self.alloc_scratch(f"addr3_{i}") for i in range(8)]
+        addr_banks = [addrs, addrs_bank1, addrs_bank2, addrs_bank3]
 
         # Setup broadcasts
         slots.append(("valu", ("vbroadcast", v_zero, zero_const)))
@@ -316,6 +334,10 @@ class KernelBuilder:
 
         self.instrs.extend(self.build(slots))
         slots = []
+
+        # Trace: init done
+        slots.append(("load", ("const", trace_marker, TRACE_INIT_DONE)))
+        slots.append(("flow", ("trace_write", trace_marker)))
 
         # === ROUND 0: All idx=0, load tree[0] once, broadcast ===
         slots.append(("alu", ("+", addr0, self.scratch["forest_values_p"], zero_const)))
@@ -393,6 +415,10 @@ class KernelBuilder:
         self.instrs.extend(self.build(slots))
         slots = []
 
+        # Trace: round 0 done
+        slots.append(("load", ("const", trace_marker, TRACE_ROUND0_DONE)))
+        slots.append(("flow", ("trace_write", trace_marker)))
+
         # === ROUND 1: idx in {1,2}, use arithmetic instead of vselect ===
         c1_const = self.scratch_const(1)
         c2_const = self.scratch_const(2)
@@ -436,6 +462,10 @@ class KernelBuilder:
 
         self.instrs.extend(self.build(slots))
         slots = []
+
+        # Trace: round 1 done
+        slots.append(("load", ("const", trace_marker, TRACE_ROUND1_DONE)))
+        slots.append(("flow", ("trace_write", trace_marker)))
 
         # === ROUND 2: idx in {3,4,5,6}, use vselect binary tree ===
         v_t3 = self.alloc_scratch("v_t3", VLEN)
@@ -507,6 +537,10 @@ class KernelBuilder:
         self.instrs.extend(self.build(slots))
         slots = []
 
+        # Trace: round 2 done
+        slots.append(("load", ("const", trace_marker, TRACE_ROUND2_DONE)))
+        slots.append(("flow", ("trace_write", trace_marker)))
+
         # === ROUNDS 3-10: Scatter rounds (before mass wrapping) ===
         # Helper for hash with multiply_add for 2 vectors
         def emit_hash_pair(vv0, vv1):
@@ -541,60 +575,76 @@ class KernelBuilder:
             slots.append(("valu", ("*", vi1, vi1, v_tmp4)))
 
         def emit_scatter_round():
-            """Generate one round of scatter with overlapped loads + compute."""
+            """Generate one round of scatter with fine-grained interleaving.
+
+            Separate addr ops from loads, then interleave loads with compute.
+            """
             nonlocal slots
 
-            def interleave_slots(load_slots, compute_slots):
+            # Collect operations
+            all_addr_ops = []
+            all_load_ops = []
+            all_compute_ops = []
+
+            n_quads = n_vecs // 4
+
+            for v in range(n_vecs):
+                bank = addr_banks[v % 4]
+                vi = all_idx + v * VLEN
+                tree_dest = all_tree + v * VLEN
+                for i in range(8):
+                    all_addr_ops.append(("alu", ("+", bank[i], self.scratch["forest_values_p"], vi + i)))
+                for i in range(8):
+                    all_load_ops.append(("load", ("load", tree_dest + i, bank[i])))
+
+            for q in range(n_quads):
+                v_start = q * 4
+                vi0, vv0, tv0 = all_idx + v_start * VLEN, all_val + v_start * VLEN, all_tree + v_start * VLEN
+                vi1, vv1, tv1 = all_idx + (v_start+1) * VLEN, all_val + (v_start+1) * VLEN, all_tree + (v_start+1) * VLEN
+                vi2, vv2, tv2 = all_idx + (v_start+2) * VLEN, all_val + (v_start+2) * VLEN, all_tree + (v_start+2) * VLEN
+                vi3, vv3, tv3 = all_idx + (v_start+3) * VLEN, all_val + (v_start+3) * VLEN, all_tree + (v_start+3) * VLEN
+                all_compute_ops.append(("valu", ("^", vv0, vv0, tv0)))
+                all_compute_ops.append(("valu", ("^", vv1, vv1, tv1)))
+                all_compute_ops.append(("valu", ("^", vv2, vv2, tv2)))
+                all_compute_ops.append(("valu", ("^", vv3, vv3, tv3)))
+                emit_hash_quad(vv0, vv1, vv2, vv3, target=all_compute_ops)
+                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=all_compute_ops)
+
+            ops_per_quad_addr = 32
+            ops_per_quad_load = 32
+            ops_per_quad_compute = len(all_compute_ops) // n_quads
+
+            # First quad: emit all addr, then all loads
+            for i in range(ops_per_quad_addr):
+                slots.append(all_addr_ops[i])
+            for i in range(ops_per_quad_load):
+                slots.append(all_load_ops[i])
+
+            # For each subsequent quad: addr, then interleave loads with prev compute
+            for q in range(1, n_quads):
+                addr_start = q * ops_per_quad_addr
+                for i in range(ops_per_quad_addr):
+                    slots.append(all_addr_ops[addr_start + i])
+
+                load_start = q * ops_per_quad_load
+                compute_start = (q - 1) * ops_per_quad_compute
+
                 li = 0
                 ci = 0
-                while li < len(load_slots) or ci < len(compute_slots):
-                    for _ in range(SLOT_LIMITS["load"]):
-                        if li < len(load_slots):
-                            slots.append(load_slots[li])
+                while li < ops_per_quad_load or ci < ops_per_quad_compute:
+                    for _ in range(2):
+                        if li < ops_per_quad_load:
+                            slots.append(all_load_ops[load_start + li])
                             li += 1
-                    for _ in range(SLOT_LIMITS["valu"]):
-                        if ci < len(compute_slots):
-                            slots.append(compute_slots[ci])
+                    for _ in range(6):
+                        if ci < ops_per_quad_compute:
+                            slots.append(all_compute_ops[compute_start + ci])
                             ci += 1
 
-            def load_slots_for_quad(v):
-                load_slots = []
-                for k in range(4):
-                    vi = all_idx + (v + k) * VLEN
-                    tree_dest = all_tree + (v + k) * VLEN
-                    for i in range(8):
-                        load_slots.append(
-                            ("alu", ("+", addrs[i], self.scratch["forest_values_p"], vi + i))
-                        )
-                    for i in range(8):
-                        load_slots.append(("load", ("load", tree_dest + i, addrs[i])))
-                return load_slots
-
-            def compute_slots_for_quad(v):
-                compute_slots = []
-                vi0, vv0, tv0 = all_idx + v * VLEN, all_val + v * VLEN, all_tree + v * VLEN
-                vi1, vv1, tv1 = all_idx + (v + 1) * VLEN, all_val + (v + 1) * VLEN, all_tree + (v + 1) * VLEN
-                vi2, vv2, tv2 = all_idx + (v + 2) * VLEN, all_val + (v + 2) * VLEN, all_tree + (v + 2) * VLEN
-                vi3, vv3, tv3 = all_idx + (v + 3) * VLEN, all_val + (v + 3) * VLEN, all_tree + (v + 3) * VLEN
-                compute_slots.append(("valu", ("^", vv0, vv0, tv0)))
-                compute_slots.append(("valu", ("^", vv1, vv1, tv1)))
-                compute_slots.append(("valu", ("^", vv2, vv2, tv2)))
-                compute_slots.append(("valu", ("^", vv3, vv3, tv3)))
-                emit_hash_quad(vv0, vv1, vv2, vv3, target=compute_slots)
-                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=compute_slots)
-                return compute_slots
-
-            prev_compute = None
-            for v in range(0, n_vecs, 4):
-                load_slots = load_slots_for_quad(v)
-                if prev_compute is None:
-                    slots.extend(load_slots)
-                else:
-                    interleave_slots(load_slots, prev_compute)
-                prev_compute = compute_slots_for_quad(v)
-
-            if prev_compute is not None:
-                slots.extend(prev_compute)
+            # Final quad: just compute
+            compute_start = (n_quads - 1) * ops_per_quad_compute
+            for i in range(ops_per_quad_compute):
+                slots.append(all_compute_ops[compute_start + i])
 
         def emit_broadcast_round():
             """Round where all idx=0, use broadcast with multiply_add optimization."""
@@ -684,6 +734,10 @@ class KernelBuilder:
                 emit_hash_quad(vv0, vv1, vv2, vv3)
                 emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
 
+        # Trace: scatter start
+        slots.append(("load", ("const", trace_marker, TRACE_SCATTER_START)))
+        slots.append(("flow", ("trace_write", trace_marker)))
+
         # Rounds 3-10: scatter (8 rounds) - emit together for better packing
         for rnd in range(3, 11):
             if rnd < rounds:
@@ -715,11 +769,23 @@ class KernelBuilder:
         self.instrs.extend(self.build(slots))
         slots = []
 
+        # Trace: scatter done
+        slots.append(("load", ("const", trace_marker, TRACE_SCATTER_DONE)))
+        slots.append(("flow", ("trace_write", trace_marker)))
+
+        # Trace: store start
+        slots.append(("load", ("const", trace_marker, TRACE_STORE_START)))
+        slots.append(("flow", ("trace_write", trace_marker)))
+
         # === STORE all val back to memory ===
         for v in range(n_vecs):
             off = self.scratch_const(VLEN * v)
             slots.append(("alu", ("+", addr1, self.scratch["inp_values_p"], off)))
             slots.append(("store", ("vstore", addr1, all_val + v * VLEN)))
+
+        # Trace: all done
+        slots.append(("load", ("const", trace_marker, TRACE_ALL_DONE)))
+        slots.append(("flow", ("trace_write", trace_marker)))
 
         self.instrs.extend(self.build(slots))
         self.instrs.append({"flow": [("pause",)]})
@@ -773,6 +839,23 @@ def do_kernel_test(
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
+    
+    # Print trace buffer timing markers
+    if machine.cores[0].trace_buf:
+        TRACE_LABELS = {
+            1: "INIT_DONE",
+            2: "ROUND0_DONE", 
+            3: "ROUND1_DONE",
+            4: "ROUND2_DONE",
+            5: "SCATTER_START",
+            6: "SCATTER_DONE",
+            7: "STORE_START",
+            8: "ALL_DONE",
+        }
+        print("\n=== Trace Markers (from trace_buf) ===")
+        for marker in machine.cores[0].trace_buf:
+            print(f"  Marker {marker}: {TRACE_LABELS.get(marker, 'UNKNOWN')}")
+    
     return machine.cycle
 
 
