@@ -211,166 +211,229 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Optimized kernel: 4x unrolled with good VLIW packing.
+        Highly optimized kernel with 4-vector processing and aggressive pipelining.
         """
+        slots = []
+
         addr0 = self.alloc_scratch("addr0")
         addr1 = self.alloc_scratch("addr1")
         tmp1 = self.alloc_scratch("tmp1")
-        
+
         init_vars = ["rounds", "n_nodes", "batch_size", "forest_height",
                      "forest_values_p", "inp_indices_p", "inp_values_p"]
         for v in init_vars:
             self.alloc_scratch(v, 1)
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            slots.append(("load", ("const", tmp1, i)))
+            slots.append(("load", ("load", self.scratch[v], tmp1)))
 
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
-        vlen_const = self.scratch_const(VLEN)
+
+        self.instrs.extend(self.build(slots))
+        slots = []
 
         self.add("flow", ("pause",))
 
-        v_idx = self.alloc_scratch("v_idx", VLEN)
-        v_val = self.alloc_scratch("v_val", VLEN)
-        v_node_val = self.alloc_scratch("v_node_val", VLEN)
+        # Allocate vector temps - need more for 4-vector processing
+        v_node_val = self.alloc_scratch("v_node_val", VLEN)  # tree vals for vec 0
+        v_nv1 = self.alloc_scratch("v_nv1", VLEN)            # tree vals for vec 1
+        v_nv2 = self.alloc_scratch("v_nv2", VLEN)            # tree vals for vec 2
+        v_nv3 = self.alloc_scratch("v_nv3", VLEN)            # tree vals for vec 3
+
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
         v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+        v_tmp4 = self.alloc_scratch("v_tmp4", VLEN)
+        v_tmp5 = self.alloc_scratch("v_tmp5", VLEN)
+        v_tmp6 = self.alloc_scratch("v_tmp6", VLEN)
+        v_tmp7 = self.alloc_scratch("v_tmp7", VLEN)
+        v_tmp8 = self.alloc_scratch("v_tmp8", VLEN)
+
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
 
         v_hash_consts = []
+        v_hash_mults = []  # For multiply_add optimization
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             vc1 = self.alloc_scratch(f"v_hc1_{hi}", VLEN)
             vc3 = self.alloc_scratch(f"v_hc3_{hi}", VLEN)
             v_hash_consts.append((vc1, vc3))
+            # Stages 0, 2, 4 can use multiply_add: (a + c1) + (a << s) = a * (2^s + 1) + c1
+            if hi in [0, 2, 4] and op1 == "+" and op2 == "+" and op3 == "<<":
+                vm = self.alloc_scratch(f"v_hm_{hi}", VLEN)
+                v_hash_mults.append((hi, vm, (1 << val3) + 1))  # (stage, vector, multiplier)
+            else:
+                v_hash_mults.append(None)
 
         round_ctr = self.alloc_scratch("round_ctr")
-        batch_ctr = self.alloc_scratch("batch_ctr")
-        cur_idx_ptr = self.alloc_scratch("cur_idx_ptr")
-        cur_val_ptr = self.alloc_scratch("cur_val_ptr")
 
-        n_vec_iters = batch_size // VLEN
+        n_vecs = batch_size // VLEN  # 32 vectors
 
-        self.instrs.append({"valu": [("vbroadcast", v_zero, zero_const)]})
-        self.instrs.append({"valu": [("vbroadcast", v_one, one_const)]})
-        self.instrs.append({"valu": [("vbroadcast", v_two, two_const)]})
-        self.instrs.append({"valu": [("vbroadcast", v_n_nodes, self.scratch["n_nodes"])]})
+        # Keep ALL idx/val in scratch across all rounds
+        all_idx = self.alloc_scratch("all_idx", batch_size)  # 256 words
+        all_val = self.alloc_scratch("all_val", batch_size)  # 256 words
+        tree_scalar = self.alloc_scratch("tree_scalar")
+
+        # ALL tree values for scatter rounds - 32 vectors × 8 elements = 256 words
+        all_tree = self.alloc_scratch("all_tree", batch_size)
+
+        # Allocate 8 address registers for parallel scatter
+        addrs = [addr0, addr1]
+        for i in range(2, 8):
+            addrs.append(self.alloc_scratch(f"addr{i}"))
+
+        # Setup broadcasts
+        slots.append(("valu", ("vbroadcast", v_zero, zero_const)))
+        slots.append(("valu", ("vbroadcast", v_one, one_const)))
+        slots.append(("valu", ("vbroadcast", v_two, two_const)))
+        slots.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1 = self.scratch_const(val1)
             c3 = self.scratch_const(val3)
             vc1, vc3 = v_hash_consts[hi]
-            self.instrs.append({"valu": [("vbroadcast", vc1, c1), ("vbroadcast", vc3, c3)]})
+            slots.append(("valu", ("vbroadcast", vc1, c1)))
+            slots.append(("valu", ("vbroadcast", vc3, c3)))
+            # Broadcast multiplier for multiply_add optimization
+            if v_hash_mults[hi] is not None:
+                _, vm, mult_val = v_hash_mults[hi]
+                cm = self.scratch_const(mult_val)
+                slots.append(("valu", ("vbroadcast", vm, cm)))
 
-        rounds_const = self.scratch_const(rounds)
-        n_vecs = n_vec_iters  # 32 vectors
-
-        # Keep ALL idx/val in scratch across all rounds (no memory traffic between rounds)
-        all_idx = self.alloc_scratch("all_idx", batch_size)  # 256 words
-        all_val = self.alloc_scratch("all_val", batch_size)  # 256 words
-        tree_scalar = self.alloc_scratch("tree_scalar")
-
-        # Helper functions
-        def emit_hash(v_val_reg):
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                vc1, vc3 = v_hash_consts[hi]
-                self.instrs.append({"valu": [(op1, v_tmp1, v_val_reg, vc1), (op3, v_tmp2, v_val_reg, vc3)]})
-                self.instrs.append({"valu": [(op2, v_val_reg, v_tmp1, v_tmp2)]})
-
-        def emit_idx_update(v_idx_reg, v_val_reg):
-            # offset = (val % 2) + 1: gives 1 when even, 2 when odd - NO VSELECT!
-            self.instrs.append({"valu": [("%", v_tmp1, v_val_reg, v_two), ("*", v_idx_reg, v_idx_reg, v_two)]})
-            self.instrs.append({"valu": [("+", v_tmp1, v_tmp1, v_one)]})
-            self.instrs.append({"valu": [("+", v_idx_reg, v_idx_reg, v_tmp1)]})
-            # Wrap: idx = idx * (idx < n_nodes) - NO VSELECT!
-            self.instrs.append({"valu": [("<", v_tmp1, v_idx_reg, v_n_nodes)]})
-            self.instrs.append({"valu": [("*", v_idx_reg, v_idx_reg, v_tmp1)]})
-
-        # === LOAD all val from memory into scratch (idx starts at 0) ===
+        # Load all values from memory into scratch
         for v in range(n_vecs):
             off = self.scratch_const(VLEN * v)
-            self.instrs.append({"alu": [("+", addr0, self.scratch["inp_values_p"], off)]})
-            self.instrs.append({"load": [("vload", all_val + v * VLEN, addr0)]})
-        
+            slots.append(("alu", ("+", addr0, self.scratch["inp_values_p"], off)))
+            slots.append(("load", ("vload", all_val + v * VLEN, addr0)))
+
         # Initialize all idx to 0
         for v in range(n_vecs):
-            self.instrs.append({"valu": [("+", all_idx + v * VLEN, v_zero, v_zero)]})
+            slots.append(("valu", ("+", all_idx + v * VLEN, v_zero, v_zero)))
 
-        # Additional temps for parallel processing
-        v_nv2 = self.alloc_scratch("v_nv2", VLEN)
-        v_tmp4 = self.alloc_scratch("v_tmp4", VLEN)
-        v_tmp5 = self.alloc_scratch("v_tmp5", VLEN)
-
-        # Helper for parallel hash (2 vectors)
-        def emit_hash_pair(vv0, vv1):
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                vc1, vc3 = v_hash_consts[hi]
-                self.instrs.append({"valu": [
-                    (op1, v_tmp1, vv0, vc1), (op3, v_tmp2, vv0, vc3),
-                    (op1, v_tmp4, vv1, vc1), (op3, v_tmp5, vv1, vc3),
-                ]})
-                self.instrs.append({"valu": [(op2, vv0, v_tmp1, v_tmp2), (op2, vv1, v_tmp4, v_tmp5)]})
-
-        def emit_idx_update_pair(vi0, vv0, vi1, vv1):
-            # offset = (val % 2) + 1: gives 1 when even, 2 when odd - NO VSELECT!
-            self.instrs.append({"valu": [
-                ("%", v_tmp1, vv0, v_two), ("%", v_tmp4, vv1, v_two),
-                ("*", vi0, vi0, v_two), ("*", vi1, vi1, v_two),
-            ]})
-            self.instrs.append({"valu": [
-                ("+", v_tmp1, v_tmp1, v_one), ("+", v_tmp4, v_tmp4, v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("+", vi0, vi0, v_tmp1), ("+", vi1, vi1, v_tmp4),
-            ]})
-            # Wrap: idx = idx * (idx < n_nodes) - NO VSELECT!
-            self.instrs.append({"valu": [("<", v_tmp1, vi0, v_n_nodes), ("<", v_tmp4, vi1, v_n_nodes)]})
-            self.instrs.append({"valu": [("*", vi0, vi0, v_tmp1), ("*", vi1, vi1, v_tmp4)]})
+        self.instrs.extend(self.build(slots))
+        slots = []
 
         # === ROUND 0: All idx=0, load tree[0] once, broadcast ===
-        self.instrs.append({"alu": [("+", addr0, self.scratch["forest_values_p"], zero_const)]})
-        self.instrs.append({"load": [("load", tree_scalar, addr0)]})
-        self.instrs.append({"valu": [("vbroadcast", v_node_val, tree_scalar)]})
-        
-        for v in range(0, n_vecs, 2):
+        slots.append(("alu", ("+", addr0, self.scratch["forest_values_p"], zero_const)))
+        slots.append(("load", ("load", tree_scalar, addr0)))
+        slots.append(("valu", ("vbroadcast", v_node_val, tree_scalar)))
+
+        # Helper: emit optimized hash for 4 vectors (quad) using multiply_add
+        def emit_hash_quad(vv0, vv1, vv2, vv3):
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                vc1, vc3 = v_hash_consts[hi]
+                if v_hash_mults[hi] is not None:
+                    _, vm, _ = v_hash_mults[hi]
+                    slots.append(("valu", ("multiply_add", vv0, vv0, vm, vc1)))
+                    slots.append(("valu", ("multiply_add", vv1, vv1, vm, vc1)))
+                    slots.append(("valu", ("multiply_add", vv2, vv2, vm, vc1)))
+                    slots.append(("valu", ("multiply_add", vv3, vv3, vm, vc1)))
+                else:
+                    slots.append(("valu", (op1, v_tmp1, vv0, vc1)))
+                    slots.append(("valu", (op3, v_tmp2, vv0, vc3)))
+                    slots.append(("valu", (op1, v_tmp3, vv1, vc1)))
+                    slots.append(("valu", (op3, v_tmp4, vv1, vc3)))
+                    slots.append(("valu", (op1, v_tmp5, vv2, vc1)))
+                    slots.append(("valu", (op3, v_tmp6, vv2, vc3)))
+                    slots.append(("valu", (op1, v_tmp7, vv3, vc1)))
+                    slots.append(("valu", (op3, v_tmp8, vv3, vc3)))
+                    slots.append(("valu", (op2, vv0, v_tmp1, v_tmp2)))
+                    slots.append(("valu", (op2, vv1, v_tmp3, v_tmp4)))
+                    slots.append(("valu", (op2, vv2, v_tmp5, v_tmp6)))
+                    slots.append(("valu", (op2, vv3, v_tmp7, v_tmp8)))
+
+        # Helper: emit index update for 4 vectors (quad) using multiply_add
+        def emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3):
+            # bit = hash % 2
+            slots.append(("valu", ("%", v_tmp1, vv0, v_two)))
+            slots.append(("valu", ("%", v_tmp2, vv1, v_two)))
+            slots.append(("valu", ("%", v_tmp3, vv2, v_two)))
+            slots.append(("valu", ("%", v_tmp4, vv3, v_two)))
+            # bit_plus_one = bit + 1
+            slots.append(("valu", ("+", v_tmp1, v_tmp1, v_one)))
+            slots.append(("valu", ("+", v_tmp2, v_tmp2, v_one)))
+            slots.append(("valu", ("+", v_tmp3, v_tmp3, v_one)))
+            slots.append(("valu", ("+", v_tmp4, v_tmp4, v_one)))
+            # idx = idx * 2 + bit_plus_one (using multiply_add)
+            slots.append(("valu", ("multiply_add", vi0, vi0, v_two, v_tmp1)))
+            slots.append(("valu", ("multiply_add", vi1, vi1, v_two, v_tmp2)))
+            slots.append(("valu", ("multiply_add", vi2, vi2, v_two, v_tmp3)))
+            slots.append(("valu", ("multiply_add", vi3, vi3, v_two, v_tmp4)))
+            # cmp = idx < n_nodes; idx = idx * cmp (wrapping)
+            slots.append(("valu", ("<", v_tmp1, vi0, v_n_nodes)))
+            slots.append(("valu", ("<", v_tmp2, vi1, v_n_nodes)))
+            slots.append(("valu", ("<", v_tmp3, vi2, v_n_nodes)))
+            slots.append(("valu", ("<", v_tmp4, vi3, v_n_nodes)))
+            slots.append(("valu", ("*", vi0, vi0, v_tmp1)))
+            slots.append(("valu", ("*", vi1, vi1, v_tmp2)))
+            slots.append(("valu", ("*", vi2, vi2, v_tmp3)))
+            slots.append(("valu", ("*", vi3, vi3, v_tmp4)))
+
+        # Process 4 vectors (quad) at a time for round 0
+        for v in range(0, n_vecs, 4):
             vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
             vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
-            self.instrs.append({"valu": [("^", vv0, vv0, v_node_val), ("^", vv1, vv1, v_node_val)]})
-            emit_hash_pair(vv0, vv1)
-            emit_idx_update_pair(vi0, vv0, vi1, vv1)
+            vi2, vv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN
+            vi3, vv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN
+            slots.append(("valu", ("^", vv0, vv0, v_node_val)))
+            slots.append(("valu", ("^", vv1, vv1, v_node_val)))
+            slots.append(("valu", ("^", vv2, vv2, v_node_val)))
+            slots.append(("valu", ("^", vv3, vv3, v_node_val)))
+            emit_hash_quad(vv0, vv1, vv2, vv3)
+            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+
+        self.instrs.extend(self.build(slots))
+        slots = []
 
         # === ROUND 1: idx in {1,2}, use arithmetic instead of vselect ===
-        # tree_val = tree[1] + (idx - 1) * (tree[2] - tree[1])
         c1_const = self.scratch_const(1)
         c2_const = self.scratch_const(2)
         tree_scalar2 = self.alloc_scratch("tree_scalar2")
         v_tree1 = self.alloc_scratch("v_tree1", VLEN)
-        v_tree_diff = self.alloc_scratch("v_tree_diff", VLEN)  # tree[2] - tree[1]
-        
-        self.instrs.append({"alu": [("+", addr0, self.scratch["forest_values_p"], c1_const),
-                                    ("+", addr1, self.scratch["forest_values_p"], c2_const)]})
-        self.instrs.append({"load": [("load", tree_scalar, addr0), ("load", tree_scalar2, addr1)]})
-        self.instrs.append({"alu": [("-", tree_scalar2, tree_scalar2, tree_scalar)]})  # diff = tree[2] - tree[1]
-        self.instrs.append({"valu": [("vbroadcast", v_tree1, tree_scalar), ("vbroadcast", v_tree_diff, tree_scalar2)]})
-        
-        for v in range(0, n_vecs, 2):
+        v_tree_diff = self.alloc_scratch("v_tree_diff", VLEN)
+
+        slots.append(("alu", ("+", addr0, self.scratch["forest_values_p"], c1_const)))
+        slots.append(("alu", ("+", addr1, self.scratch["forest_values_p"], c2_const)))
+        slots.append(("load", ("load", tree_scalar, addr0)))
+        slots.append(("load", ("load", tree_scalar2, addr1)))
+        slots.append(("alu", ("-", tree_scalar2, tree_scalar2, tree_scalar)))
+        slots.append(("valu", ("vbroadcast", v_tree1, tree_scalar)))
+        slots.append(("valu", ("vbroadcast", v_tree_diff, tree_scalar2)))
+
+        # Process 4 vectors at a time with multiply_add
+        for v in range(0, n_vecs, 4):
             vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
             vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
-            # tree_val = tree[1] + (idx - 1) * diff, NO VSELECT!
-            self.instrs.append({"valu": [("-", v_node_val, vi0, v_one), ("-", v_nv2, vi1, v_one)]})
-            self.instrs.append({"valu": [("*", v_node_val, v_node_val, v_tree_diff), ("*", v_nv2, v_nv2, v_tree_diff)]})
-            self.instrs.append({"valu": [("+", v_node_val, v_node_val, v_tree1), ("+", v_nv2, v_nv2, v_tree1)]})
-            self.instrs.append({"valu": [("^", vv0, vv0, v_node_val), ("^", vv1, vv1, v_nv2)]})
-            emit_hash_pair(vv0, vv1)
-            emit_idx_update_pair(vi0, vv0, vi1, vv1)
+            vi2, vv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN
+            vi3, vv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN
+            # Compute tree values for 4 vectors
+            slots.append(("valu", ("-", v_node_val, vi0, v_one)))
+            slots.append(("valu", ("-", v_nv1, vi1, v_one)))
+            slots.append(("valu", ("-", v_nv2, vi2, v_one)))
+            slots.append(("valu", ("-", v_nv3, vi3, v_one)))
+            slots.append(("valu", ("*", v_node_val, v_node_val, v_tree_diff)))
+            slots.append(("valu", ("*", v_nv1, v_nv1, v_tree_diff)))
+            slots.append(("valu", ("*", v_nv2, v_nv2, v_tree_diff)))
+            slots.append(("valu", ("*", v_nv3, v_nv3, v_tree_diff)))
+            slots.append(("valu", ("+", v_node_val, v_node_val, v_tree1)))
+            slots.append(("valu", ("+", v_nv1, v_nv1, v_tree1)))
+            slots.append(("valu", ("+", v_nv2, v_nv2, v_tree1)))
+            slots.append(("valu", ("+", v_nv3, v_nv3, v_tree1)))
+            slots.append(("valu", ("^", vv0, vv0, v_node_val)))
+            slots.append(("valu", ("^", vv1, vv1, v_nv1)))
+            slots.append(("valu", ("^", vv2, vv2, v_nv2)))
+            slots.append(("valu", ("^", vv3, vv3, v_nv3)))
+            emit_hash_quad(vv0, vv1, vv2, vv3)
+            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+
+        self.instrs.extend(self.build(slots))
+        slots = []
 
         # === ROUND 2: idx in {3,4,5,6}, use vselect binary tree ===
-        # Load all 4 tree values and broadcast
         v_t3 = self.alloc_scratch("v_t3", VLEN)
         v_t4 = self.alloc_scratch("v_t4", VLEN)
         v_t5 = self.alloc_scratch("v_t5", VLEN)
@@ -383,143 +446,330 @@ class KernelBuilder:
         c4 = self.scratch_const(4)
         c5 = self.scratch_const(5)
         c6 = self.scratch_const(6)
-        
-        self.instrs.append({"alu": [("+", addr0, self.scratch["forest_values_p"], c3),
-                                    ("+", addr1, self.scratch["forest_values_p"], c4)]})
-        self.instrs.append({"load": [("load", ts3, addr0), ("load", ts4, addr1)]})
-        self.instrs.append({"alu": [("+", addr0, self.scratch["forest_values_p"], c5),
-                                    ("+", addr1, self.scratch["forest_values_p"], self.scratch_const(6))]})
-        self.instrs.append({"load": [("load", ts5, addr0), ("load", ts6, addr1)]})
-        self.instrs.append({"valu": [("vbroadcast", v_t3, ts3), ("vbroadcast", v_t4, ts4)]})
-        self.instrs.append({"valu": [("vbroadcast", v_t5, ts5), ("vbroadcast", v_t6, ts6)]})
-        
+
+        slots.append(("alu", ("+", addr0, self.scratch["forest_values_p"], c3)))
+        slots.append(("alu", ("+", addr1, self.scratch["forest_values_p"], c4)))
+        slots.append(("load", ("load", ts3, addr0)))
+        slots.append(("load", ("load", ts4, addr1)))
+        slots.append(("alu", ("+", addr0, self.scratch["forest_values_p"], c5)))
+        slots.append(("alu", ("+", addr1, self.scratch["forest_values_p"], c6)))
+        slots.append(("load", ("load", ts5, addr0)))
+        slots.append(("load", ("load", ts6, addr1)))
+        slots.append(("valu", ("vbroadcast", v_t3, ts3)))
+        slots.append(("valu", ("vbroadcast", v_t4, ts4)))
+        slots.append(("valu", ("vbroadcast", v_t5, ts5)))
+        slots.append(("valu", ("vbroadcast", v_t6, ts6)))
+
         v_three = self.alloc_scratch("v_three", VLEN)
-        self.instrs.append({"valu": [("vbroadcast", v_three, c3)]})
-        
-        # Process round 2 in pairs like other rounds
-        for v in range(0, n_vecs, 2):
+        slots.append(("valu", ("vbroadcast", v_three, c3)))
+
+        self.instrs.extend(self.build(slots))
+        slots = []
+
+        # Helper to emit vselect tree lookup for 2 vectors
+        def emit_vselect_lookup_pair(vi0_in, vi1_in, result0, result1):
+            """Binary tree vselect: idx in {3,4,5,6} -> tree[idx]"""
+            slots.append(("valu", ("-", v_tmp1, vi0_in, v_three)))
+            slots.append(("valu", ("-", v_tmp4, vi1_in, v_three)))
+            slots.append(("valu", ("%", v_tmp2, v_tmp1, v_two)))
+            slots.append(("valu", (">>", v_tmp3, v_tmp1, v_one)))
+            slots.append(("valu", ("%", v_tmp5, v_tmp4, v_two)))
+            slots.append(("valu", (">>", v_tmp6, v_tmp4, v_one)))
+            slots.append(("flow", ("vselect", result0, v_tmp2, v_t4, v_t3)))
+            slots.append(("flow", ("vselect", v_tmp1, v_tmp2, v_t6, v_t5)))
+            slots.append(("flow", ("vselect", result0, v_tmp3, v_tmp1, result0)))
+            slots.append(("flow", ("vselect", result1, v_tmp5, v_t4, v_t3)))
+            slots.append(("flow", ("vselect", v_tmp4, v_tmp5, v_t6, v_t5)))
+            slots.append(("flow", ("vselect", result1, v_tmp6, v_tmp4, result1)))
+
+        # Process 4 vectors at a time with multiply_add for hash
+        for v in range(0, n_vecs, 4):
             vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
             vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
-            # offset = idx - 3 for both
-            self.instrs.append({"valu": [("-", v_tmp1, vi0, v_three), ("-", v_tmp4, vi1, v_three)]})
-            # bit0 = offset % 2, bit1 = offset >> 1
-            self.instrs.append({"valu": [("%", v_tmp2, v_tmp1, v_two), (">>", v_tmp3, v_tmp1, v_one),
-                                         ("%", v_tmp5, v_tmp4, v_two), (">>", v_nv2, v_tmp4, v_one)]})
-            # Select for vector 0
-            self.instrs.append({"flow": [("vselect", v_node_val, v_tmp2, v_t4, v_t3)]})
-            self.instrs.append({"flow": [("vselect", v_tmp1, v_tmp2, v_t6, v_t5)]})
-            self.instrs.append({"flow": [("vselect", v_node_val, v_tmp3, v_tmp1, v_node_val)]})
-            # Select for vector 1
-            self.instrs.append({"flow": [("vselect", v_tmp4, v_tmp5, v_t4, v_t3)]})
-            self.instrs.append({"flow": [("vselect", v_tmp1, v_tmp5, v_t6, v_t5)]})
-            self.instrs.append({"flow": [("vselect", v_tmp4, v_nv2, v_tmp1, v_tmp4)]})
-            # XOR and process both
-            self.instrs.append({"valu": [("^", vv0, vv0, v_node_val), ("^", vv1, vv1, v_tmp4)]})
-            emit_hash_pair(vv0, vv1)
-            emit_idx_update_pair(vi0, vv0, vi1, vv1)
+            vi2, vv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN
+            vi3, vv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN
+            # Vselect for tree lookup - 2 pairs at a time (flow slot limited)
+            emit_vselect_lookup_pair(vi0, vi1, v_node_val, v_nv1)
+            emit_vselect_lookup_pair(vi2, vi3, v_nv2, v_nv3)
+            # XOR
+            slots.append(("valu", ("^", vv0, vv0, v_node_val)))
+            slots.append(("valu", ("^", vv1, vv1, v_nv1)))
+            slots.append(("valu", ("^", vv2, vv2, v_nv2)))
+            slots.append(("valu", ("^", vv3, vv3, v_nv3)))
+            # Hash and idx update with multiply_add
+            emit_hash_quad(vv0, vv1, vv2, vv3)
+            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
 
-        # === ROUNDS 3+: Optimized with pipelined gather and parallel hash ===
-        remaining = rounds - 3
-        if remaining > 0:
-            
-            self.instrs.append({"load": [("const", round_ctr, 0)]})
-            remaining_const = self.scratch_const(remaining)
-            
-            outer_loop = len(self.instrs)
-            
-            # Allocate address registers once
-            addrs = [addr0, addr1]
-            for i in range(2, 8):
-                if f"addr{i}" not in self.scratch:
-                    addrs.append(self.alloc_scratch(f"addr{i}"))
-                else:
-                    addrs.append(self.scratch[f"addr{i}"])
-            
-            # Process all vector pairs with software pipelining
-            # Prologue: start gather for first pair
-            vi0 = all_idx
-            vv0 = all_val
-            vi1 = all_idx + VLEN
-            vv1 = all_val + VLEN
-            
-            self.instrs.append({"alu": [("+", addrs[i], self.scratch["forest_values_p"], vi0 + i) for i in range(8)]})
-            for i in range(0, 8, 2):
-                self.instrs.append({"load": [("load", v_node_val + i, addrs[i]), ("load", v_node_val + i + 1, addrs[i + 1])]})
-            self.instrs.append({"alu": [("+", addrs[i], self.scratch["forest_values_p"], vi1 + i) for i in range(8)]})
-            for i in range(0, 8, 2):
-                self.instrs.append({"load": [("load", v_nv2 + i, addrs[i]), ("load", v_nv2 + i + 1, addrs[i + 1])]})
-            
-            # Main loop: overlap gather(V+1) with compute(V)
-            for v in range(0, n_vecs - 2, 2):
-                vi0 = all_idx + v * VLEN
-                vv0 = all_val + v * VLEN
-                vi1 = all_idx + (v + 1) * VLEN
-                vv1 = all_val + (v + 1) * VLEN
-                vi0_next = all_idx + (v + 2) * VLEN
-                vi1_next = all_idx + (v + 3) * VLEN
-                
-                # XOR current pair while starting address compute for next
-                self.instrs.append({
-                    "valu": [("^", vv0, vv0, v_node_val), ("^", vv1, vv1, v_nv2)],
-                    "alu": [("+", addrs[i], self.scratch["forest_values_p"], vi0_next + i) for i in range(4)]
-                })
-                
-                # Hash + continue gather for next pair (interleave VALU with loads)
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    vc1, vc3 = v_hash_consts[hi]
-                    if hi < 4:  # First 4 hash stages: interleave with loads
-                        self.instrs.append({
-                            "valu": [(op1, v_tmp1, vv0, vc1), (op3, v_tmp2, vv0, vc3), (op1, v_tmp4, vv1, vc1), (op3, v_tmp5, vv1, vc3)],
-                            "load": [("load", v_node_val + hi*2, addrs[hi*2]), ("load", v_node_val + hi*2 + 1, addrs[hi*2 + 1])] if hi < 4 else []
-                        })
-                    else:
-                        self.instrs.append({"valu": [(op1, v_tmp1, vv0, vc1), (op3, v_tmp2, vv0, vc3), (op1, v_tmp4, vv1, vc1), (op3, v_tmp5, vv1, vc3)]})
-                    self.instrs.append({"valu": [(op2, vv0, v_tmp1, v_tmp2), (op2, vv1, v_tmp4, v_tmp5)]})
-                
-                # Address compute for vi1_next + remaining loads
-                self.instrs.append({"alu": [("+", addrs[i], self.scratch["forest_values_p"], vi0_next + i + 4) for i in range(4)]})
-                for i in range(0, 4, 2):
-                    self.instrs.append({"load": [("load", v_node_val + 4 + i, addrs[i]), ("load", v_node_val + 5 + i, addrs[i + 1])]})
-                self.instrs.append({"alu": [("+", addrs[i], self.scratch["forest_values_p"], vi1_next + i) for i in range(8)]})
-                for i in range(0, 8, 2):
-                    self.instrs.append({"load": [("load", v_nv2 + i, addrs[i]), ("load", v_nv2 + i + 1, addrs[i + 1])]})
-                
-                # Index update for current pair
-                self.instrs.append({"valu": [("%", v_tmp1, vv0, v_two), ("%", v_tmp4, vv1, v_two), ("*", vi0, vi0, v_two), ("*", vi1, vi1, v_two)]})
-                self.instrs.append({"valu": [("+", v_tmp1, v_tmp1, v_one), ("+", v_tmp4, v_tmp4, v_one)]})
-                self.instrs.append({"valu": [("+", vi0, vi0, v_tmp1), ("+", vi1, vi1, v_tmp4)]})
-                self.instrs.append({"valu": [("<", v_tmp1, vi0, v_n_nodes), ("<", v_tmp4, vi1, v_n_nodes)]})
-                self.instrs.append({"valu": [("*", vi0, vi0, v_tmp1), ("*", vi1, vi1, v_tmp4)]})
-            
-            # Epilogue: process last pair (no next pair to prefetch)
-            v = n_vecs - 2
-            vi0 = all_idx + v * VLEN
-            vv0 = all_val + v * VLEN
-            vi1 = all_idx + (v + 1) * VLEN
-            vv1 = all_val + (v + 1) * VLEN
-            self.instrs.append({"valu": [("^", vv0, vv0, v_node_val), ("^", vv1, vv1, v_nv2)]})
+        self.instrs.extend(self.build(slots))
+        slots = []
+
+        # === ROUNDS 3-10: Scatter rounds (before mass wrapping) ===
+        # Helper for hash with multiply_add for 2 vectors
+        def emit_hash_pair(vv0, vv1):
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 vc1, vc3 = v_hash_consts[hi]
-                self.instrs.append({"valu": [(op1, v_tmp1, vv0, vc1), (op3, v_tmp2, vv0, vc3), (op1, v_tmp4, vv1, vc1), (op3, v_tmp5, vv1, vc3)]})
-                self.instrs.append({"valu": [(op2, vv0, v_tmp1, v_tmp2), (op2, vv1, v_tmp4, v_tmp5)]})
-            self.instrs.append({"valu": [("%", v_tmp1, vv0, v_two), ("%", v_tmp4, vv1, v_two), ("*", vi0, vi0, v_two), ("*", vi1, vi1, v_two)]})
-            self.instrs.append({"valu": [("+", v_tmp1, v_tmp1, v_one), ("+", v_tmp4, v_tmp4, v_one)]})
-            self.instrs.append({"valu": [("+", vi0, vi0, v_tmp1), ("+", vi1, vi1, v_tmp4)]})
-            self.instrs.append({"valu": [("<", v_tmp1, vi0, v_n_nodes), ("<", v_tmp4, vi1, v_n_nodes)]})
-            self.instrs.append({"valu": [("*", vi0, vi0, v_tmp1), ("*", vi1, vi1, v_tmp4)]})
-            
-            self.instrs.append({"alu": [("+", round_ctr, round_ctr, one_const)]})
-            self.instrs.append({"alu": [("<", tmp1, round_ctr, remaining_const)]})
-            self.instrs.append({"flow": [("cond_jump", tmp1, outer_loop)]})
+                if v_hash_mults[hi] is not None:
+                    _, vm, _ = v_hash_mults[hi]
+                    slots.append(("valu", ("multiply_add", vv0, vv0, vm, vc1)))
+                    slots.append(("valu", ("multiply_add", vv1, vv1, vm, vc1)))
+                else:
+                    slots.append(("valu", (op1, v_tmp1, vv0, vc1)))
+                    slots.append(("valu", (op3, v_tmp2, vv0, vc3)))
+                    slots.append(("valu", (op1, v_tmp4, vv1, vc1)))
+                    slots.append(("valu", (op3, v_tmp5, vv1, vc3)))
+                    slots.append(("valu", (op2, vv0, v_tmp1, v_tmp2)))
+                    slots.append(("valu", (op2, vv1, v_tmp4, v_tmp5)))
 
-        # === STORE all idx/val back to memory (once) ===
+        # Helper for idx update for 2 vectors using multiply_add
+        def emit_idx_pair(vi0, vv0, vi1, vv1):
+            # bit = hash % 2; bit_plus_one = bit + 1
+            slots.append(("valu", ("%", v_tmp1, vv0, v_two)))
+            slots.append(("valu", ("%", v_tmp4, vv1, v_two)))
+            slots.append(("valu", ("+", v_tmp1, v_tmp1, v_one)))
+            slots.append(("valu", ("+", v_tmp4, v_tmp4, v_one)))
+            # idx = idx * 2 + bit_plus_one (using multiply_add)
+            slots.append(("valu", ("multiply_add", vi0, vi0, v_two, v_tmp1)))
+            slots.append(("valu", ("multiply_add", vi1, vi1, v_two, v_tmp4)))
+            # cmp = idx < n_nodes; idx = idx * cmp (wrapping)
+            slots.append(("valu", ("<", v_tmp1, vi0, v_n_nodes)))
+            slots.append(("valu", ("<", v_tmp4, vi1, v_n_nodes)))
+            slots.append(("valu", ("*", vi0, vi0, v_tmp1)))
+            slots.append(("valu", ("*", vi1, vi1, v_tmp4)))
+
+        def emit_scatter_round():
+            """Generate one round of scatter with fine-grained interleaved loads + compute."""
+            nonlocal slots
+            # Prolog: Load tree values for vectors 0-3
+            for v in range(4):
+                vi = all_idx + v * VLEN
+                tree_dest = all_tree + v * VLEN
+                for i in range(8):
+                    slots.append(("alu", ("+", addrs[i], self.scratch["forest_values_p"], vi + i)))
+                for i in range(8):
+                    slots.append(("load", ("load", tree_dest + i, addrs[i])))
+
+            # Main loop: Fine-grained interleaving of compute and loads
+            # For each group of 4 vectors, interleave hash stages with loads for next group
+            for v in range(0, n_vecs - 4, 4):
+                vi0 = all_idx + v * VLEN
+                vv0 = all_val + v * VLEN
+                tv0 = all_tree + v * VLEN
+                vi1 = all_idx + (v + 1) * VLEN
+                vv1 = all_val + (v + 1) * VLEN
+                tv1 = all_tree + (v + 1) * VLEN
+                vi2 = all_idx + (v + 2) * VLEN
+                vv2 = all_val + (v + 2) * VLEN
+                tv2 = all_tree + (v + 2) * VLEN
+                vi3 = all_idx + (v + 3) * VLEN
+                vv3 = all_val + (v + 3) * VLEN
+                tv3 = all_tree + (v + 3) * VLEN
+
+                # XOR
+                slots.append(("valu", ("^", vv0, vv0, tv0)))
+                slots.append(("valu", ("^", vv1, vv1, tv1)))
+                slots.append(("valu", ("^", vv2, vv2, tv2)))
+                slots.append(("valu", ("^", vv3, vv3, tv3)))
+
+                # Interleave hash stages with loads for next 4 vectors
+                load_vec_idx = 0
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    vc1, vc3 = v_hash_consts[hi]
+                    if v_hash_mults[hi] is not None:
+                        _, vm, _ = v_hash_mults[hi]
+                        slots.append(("valu", ("multiply_add", vv0, vv0, vm, vc1)))
+                        slots.append(("valu", ("multiply_add", vv1, vv1, vm, vc1)))
+                        slots.append(("valu", ("multiply_add", vv2, vv2, vm, vc1)))
+                        slots.append(("valu", ("multiply_add", vv3, vv3, vm, vc1)))
+                    else:
+                        slots.append(("valu", (op1, v_tmp1, vv0, vc1)))
+                        slots.append(("valu", (op3, v_tmp2, vv0, vc3)))
+                        slots.append(("valu", (op1, v_tmp3, vv1, vc1)))
+                        slots.append(("valu", (op3, v_tmp4, vv1, vc3)))
+                        slots.append(("valu", (op1, v_tmp5, vv2, vc1)))
+                        slots.append(("valu", (op3, v_tmp6, vv2, vc3)))
+                        slots.append(("valu", (op1, v_tmp7, vv3, vc1)))
+                        slots.append(("valu", (op3, v_tmp8, vv3, vc3)))
+                        slots.append(("valu", (op2, vv0, v_tmp1, v_tmp2)))
+                        slots.append(("valu", (op2, vv1, v_tmp3, v_tmp4)))
+                        slots.append(("valu", (op2, vv2, v_tmp5, v_tmp6)))
+                        slots.append(("valu", (op2, vv3, v_tmp7, v_tmp8)))
+
+                    # Interleave loads: compute addresses and issue loads
+                    if load_vec_idx < 4:
+                        vn = v + 4 + load_vec_idx
+                        if vn < n_vecs:
+                            vi_next = all_idx + vn * VLEN
+                            tree_dest = all_tree + vn * VLEN
+                            for i in range(8):
+                                slots.append(("alu", ("+", addrs[i], self.scratch["forest_values_p"], vi_next + i)))
+                            for i in range(8):
+                                slots.append(("load", ("load", tree_dest + i, addrs[i])))
+                        load_vec_idx += 1
+
+                # Index update
+                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+
+                # Load remaining vectors if not all loaded during hash
+                while load_vec_idx < 4:
+                    vn = v + 4 + load_vec_idx
+                    if vn < n_vecs:
+                        vi_next = all_idx + vn * VLEN
+                        tree_dest = all_tree + vn * VLEN
+                        for i in range(8):
+                            slots.append(("alu", ("+", addrs[i], self.scratch["forest_values_p"], vi_next + i)))
+                        for i in range(8):
+                            slots.append(("load", ("load", tree_dest + i, addrs[i])))
+                    load_vec_idx += 1
+
+            # Epilog: Compute on last 4 vectors (28-31)
+            v = n_vecs - 4
+            vi0 = all_idx + v * VLEN
+            vv0 = all_val + v * VLEN
+            tv0 = all_tree + v * VLEN
+            vi1 = all_idx + (v + 1) * VLEN
+            vv1 = all_val + (v + 1) * VLEN
+            tv1 = all_tree + (v + 1) * VLEN
+            vi2 = all_idx + (v + 2) * VLEN
+            vv2 = all_val + (v + 2) * VLEN
+            tv2 = all_tree + (v + 2) * VLEN
+            vi3 = all_idx + (v + 3) * VLEN
+            vv3 = all_val + (v + 3) * VLEN
+            tv3 = all_tree + (v + 3) * VLEN
+            slots.append(("valu", ("^", vv0, vv0, tv0)))
+            slots.append(("valu", ("^", vv1, vv1, tv1)))
+            slots.append(("valu", ("^", vv2, vv2, tv2)))
+            slots.append(("valu", ("^", vv3, vv3, tv3)))
+            emit_hash_quad(vv0, vv1, vv2, vv3)
+            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+
+        def emit_broadcast_round():
+            """Round where all idx=0, use broadcast with multiply_add optimization."""
+            nonlocal slots
+            slots.append(("alu", ("+", addr0, self.scratch["forest_values_p"], zero_const)))
+            slots.append(("load", ("load", tree_scalar, addr0)))
+            slots.append(("valu", ("vbroadcast", v_node_val, tree_scalar)))
+            # Process 4 vectors at a time with multiply_add
+            for v in range(0, n_vecs, 4):
+                vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
+                vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
+                vi2, vv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN
+                vi3, vv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN
+                slots.append(("valu", ("^", vv0, vv0, v_node_val)))
+                slots.append(("valu", ("^", vv1, vv1, v_node_val)))
+                slots.append(("valu", ("^", vv2, vv2, v_node_val)))
+                slots.append(("valu", ("^", vv3, vv3, v_node_val)))
+                emit_hash_quad(vv0, vv1, vv2, vv3)
+                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+
+        def emit_arith_round():
+            """Round where idx in {1,2}, use arithmetic with multiply_add."""
+            nonlocal slots
+            slots.append(("alu", ("+", addr0, self.scratch["forest_values_p"], c1_const)))
+            slots.append(("alu", ("+", addr1, self.scratch["forest_values_p"], c2_const)))
+            slots.append(("load", ("load", tree_scalar, addr0)))
+            slots.append(("load", ("load", tree_scalar2, addr1)))
+            slots.append(("alu", ("-", tree_scalar2, tree_scalar2, tree_scalar)))
+            slots.append(("valu", ("vbroadcast", v_tree1, tree_scalar)))
+            slots.append(("valu", ("vbroadcast", v_tree_diff, tree_scalar2)))
+            # Process 4 vectors at a time
+            for v in range(0, n_vecs, 4):
+                vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
+                vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
+                vi2, vv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN
+                vi3, vv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN
+                # Compute tree values for 4 vectors
+                slots.append(("valu", ("-", v_node_val, vi0, v_one)))
+                slots.append(("valu", ("-", v_nv1, vi1, v_one)))
+                slots.append(("valu", ("-", v_nv2, vi2, v_one)))
+                slots.append(("valu", ("-", v_nv3, vi3, v_one)))
+                slots.append(("valu", ("*", v_node_val, v_node_val, v_tree_diff)))
+                slots.append(("valu", ("*", v_nv1, v_nv1, v_tree_diff)))
+                slots.append(("valu", ("*", v_nv2, v_nv2, v_tree_diff)))
+                slots.append(("valu", ("*", v_nv3, v_nv3, v_tree_diff)))
+                slots.append(("valu", ("+", v_node_val, v_node_val, v_tree1)))
+                slots.append(("valu", ("+", v_nv1, v_nv1, v_tree1)))
+                slots.append(("valu", ("+", v_nv2, v_nv2, v_tree1)))
+                slots.append(("valu", ("+", v_nv3, v_nv3, v_tree1)))
+                slots.append(("valu", ("^", vv0, vv0, v_node_val)))
+                slots.append(("valu", ("^", vv1, vv1, v_nv1)))
+                slots.append(("valu", ("^", vv2, vv2, v_nv2)))
+                slots.append(("valu", ("^", vv3, vv3, v_nv3)))
+                emit_hash_quad(vv0, vv1, vv2, vv3)
+                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+
+        def emit_vselect_round():
+            """Round where idx in {3-6}, use vselect with multiply_add for hash."""
+            nonlocal slots
+            slots.append(("alu", ("+", addr0, self.scratch["forest_values_p"], c3)))
+            slots.append(("alu", ("+", addr1, self.scratch["forest_values_p"], c4)))
+            slots.append(("load", ("load", ts3, addr0)))
+            slots.append(("load", ("load", ts4, addr1)))
+            slots.append(("alu", ("+", addr0, self.scratch["forest_values_p"], c5)))
+            slots.append(("alu", ("+", addr1, self.scratch["forest_values_p"], c6)))
+            slots.append(("load", ("load", ts5, addr0)))
+            slots.append(("load", ("load", ts6, addr1)))
+            slots.append(("valu", ("vbroadcast", v_t3, ts3)))
+            slots.append(("valu", ("vbroadcast", v_t4, ts4)))
+            slots.append(("valu", ("vbroadcast", v_t5, ts5)))
+            slots.append(("valu", ("vbroadcast", v_t6, ts6)))
+            # Process 4 vectors at a time with multiply_add for hash
+            for v in range(0, n_vecs, 4):
+                vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
+                vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
+                vi2, vv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN
+                vi3, vv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN
+                # Vselect for tree lookup - 2 pairs at a time (flow slot limited)
+                emit_vselect_lookup_pair(vi0, vi1, v_node_val, v_nv1)
+                emit_vselect_lookup_pair(vi2, vi3, v_nv2, v_nv3)
+                # XOR
+                slots.append(("valu", ("^", vv0, vv0, v_node_val)))
+                slots.append(("valu", ("^", vv1, vv1, v_nv1)))
+                slots.append(("valu", ("^", vv2, vv2, v_nv2)))
+                slots.append(("valu", ("^", vv3, vv3, v_nv3)))
+                # Hash and idx update with multiply_add
+                emit_hash_quad(vv0, vv1, vv2, vv3)
+                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+
+        # Rounds 3-10: scatter (8 rounds) - emit together for better packing
+        for rnd in range(3, 11):
+            if rnd < rounds:
+                emit_scatter_round()
+        self.instrs.extend(self.build(slots))
+        slots = []
+
+        # Round 11: broadcast (all idx wrapped to 0)
+        if 11 < rounds:
+            emit_broadcast_round()
+            self.instrs.extend(self.build(slots))
+            slots = []
+
+        # Round 12: arithmetic (idx in {1,2})
+        if 12 < rounds:
+            emit_arith_round()
+            self.instrs.extend(self.build(slots))
+            slots = []
+
+        # Round 13: vselect (idx in {3-6})
+        if 13 < rounds:
+            emit_vselect_round()
+            self.instrs.extend(self.build(slots))
+            slots = []
+
+        # Rounds 14-15: scatter - emit together
+        for rnd in range(14, rounds):
+            emit_scatter_round()
+        self.instrs.extend(self.build(slots))
+        slots = []
+
+        # === STORE all idx/val back to memory ===
         for v in range(n_vecs):
             off = self.scratch_const(VLEN * v)
-            self.instrs.append({"alu": [("+", addr0, self.scratch["inp_indices_p"], off),
-                                        ("+", addr1, self.scratch["inp_values_p"], off)]})
-            self.instrs.append({"store": [("vstore", addr0, all_idx + v * VLEN),
-                                          ("vstore", addr1, all_val + v * VLEN)]})
+            slots.append(("alu", ("+", addr0, self.scratch["inp_indices_p"], off)))
+            slots.append(("alu", ("+", addr1, self.scratch["inp_values_p"], off)))
+            slots.append(("store", ("vstore", addr0, all_idx + v * VLEN)))
+            slots.append(("store", ("vstore", addr1, all_val + v * VLEN)))
 
+        self.instrs.extend(self.build(slots))
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
