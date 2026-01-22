@@ -323,55 +323,59 @@ class KernelBuilder:
         slots.append(("valu", ("vbroadcast", v_node_val, tree_scalar)))
 
         # Helper: emit optimized hash for 4 vectors (quad) using multiply_add
-        def emit_hash_quad(vv0, vv1, vv2, vv3):
+        def emit_hash_quad(vv0, vv1, vv2, vv3, target=None):
+            if target is None:
+                target = slots
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 vc1, vc3 = v_hash_consts[hi]
                 if v_hash_mults[hi] is not None:
                     _, vm, _ = v_hash_mults[hi]
-                    slots.append(("valu", ("multiply_add", vv0, vv0, vm, vc1)))
-                    slots.append(("valu", ("multiply_add", vv1, vv1, vm, vc1)))
-                    slots.append(("valu", ("multiply_add", vv2, vv2, vm, vc1)))
-                    slots.append(("valu", ("multiply_add", vv3, vv3, vm, vc1)))
+                    target.append(("valu", ("multiply_add", vv0, vv0, vm, vc1)))
+                    target.append(("valu", ("multiply_add", vv1, vv1, vm, vc1)))
+                    target.append(("valu", ("multiply_add", vv2, vv2, vm, vc1)))
+                    target.append(("valu", ("multiply_add", vv3, vv3, vm, vc1)))
                 else:
-                    slots.append(("valu", (op1, v_tmp1, vv0, vc1)))
-                    slots.append(("valu", (op3, v_tmp2, vv0, vc3)))
-                    slots.append(("valu", (op1, v_tmp3, vv1, vc1)))
-                    slots.append(("valu", (op3, v_tmp4, vv1, vc3)))
-                    slots.append(("valu", (op1, v_tmp5, vv2, vc1)))
-                    slots.append(("valu", (op3, v_tmp6, vv2, vc3)))
-                    slots.append(("valu", (op1, v_tmp7, vv3, vc1)))
-                    slots.append(("valu", (op3, v_tmp8, vv3, vc3)))
-                    slots.append(("valu", (op2, vv0, v_tmp1, v_tmp2)))
-                    slots.append(("valu", (op2, vv1, v_tmp3, v_tmp4)))
-                    slots.append(("valu", (op2, vv2, v_tmp5, v_tmp6)))
-                    slots.append(("valu", (op2, vv3, v_tmp7, v_tmp8)))
+                    target.append(("valu", (op1, v_tmp1, vv0, vc1)))
+                    target.append(("valu", (op3, v_tmp2, vv0, vc3)))
+                    target.append(("valu", (op1, v_tmp3, vv1, vc1)))
+                    target.append(("valu", (op3, v_tmp4, vv1, vc3)))
+                    target.append(("valu", (op1, v_tmp5, vv2, vc1)))
+                    target.append(("valu", (op3, v_tmp6, vv2, vc3)))
+                    target.append(("valu", (op1, v_tmp7, vv3, vc1)))
+                    target.append(("valu", (op3, v_tmp8, vv3, vc3)))
+                    target.append(("valu", (op2, vv0, v_tmp1, v_tmp2)))
+                    target.append(("valu", (op2, vv1, v_tmp3, v_tmp4)))
+                    target.append(("valu", (op2, vv2, v_tmp5, v_tmp6)))
+                    target.append(("valu", (op2, vv3, v_tmp7, v_tmp8)))
 
         # Helper: emit index update for 4 vectors (quad) using multiply_add
-        def emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3):
+        def emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=None):
+            if target is None:
+                target = slots
             # bit = hash % 2
-            slots.append(("valu", ("%", v_tmp1, vv0, v_two)))
-            slots.append(("valu", ("%", v_tmp2, vv1, v_two)))
-            slots.append(("valu", ("%", v_tmp3, vv2, v_two)))
-            slots.append(("valu", ("%", v_tmp4, vv3, v_two)))
+            target.append(("valu", ("%", v_tmp1, vv0, v_two)))
+            target.append(("valu", ("%", v_tmp2, vv1, v_two)))
+            target.append(("valu", ("%", v_tmp3, vv2, v_two)))
+            target.append(("valu", ("%", v_tmp4, vv3, v_two)))
             # bit_plus_one = bit + 1
-            slots.append(("valu", ("+", v_tmp1, v_tmp1, v_one)))
-            slots.append(("valu", ("+", v_tmp2, v_tmp2, v_one)))
-            slots.append(("valu", ("+", v_tmp3, v_tmp3, v_one)))
-            slots.append(("valu", ("+", v_tmp4, v_tmp4, v_one)))
+            target.append(("valu", ("+", v_tmp1, v_tmp1, v_one)))
+            target.append(("valu", ("+", v_tmp2, v_tmp2, v_one)))
+            target.append(("valu", ("+", v_tmp3, v_tmp3, v_one)))
+            target.append(("valu", ("+", v_tmp4, v_tmp4, v_one)))
             # idx = idx * 2 + bit_plus_one (using multiply_add)
-            slots.append(("valu", ("multiply_add", vi0, vi0, v_two, v_tmp1)))
-            slots.append(("valu", ("multiply_add", vi1, vi1, v_two, v_tmp2)))
-            slots.append(("valu", ("multiply_add", vi2, vi2, v_two, v_tmp3)))
-            slots.append(("valu", ("multiply_add", vi3, vi3, v_two, v_tmp4)))
+            target.append(("valu", ("multiply_add", vi0, vi0, v_two, v_tmp1)))
+            target.append(("valu", ("multiply_add", vi1, vi1, v_two, v_tmp2)))
+            target.append(("valu", ("multiply_add", vi2, vi2, v_two, v_tmp3)))
+            target.append(("valu", ("multiply_add", vi3, vi3, v_two, v_tmp4)))
             # cmp = idx < n_nodes; idx = idx * cmp (wrapping)
-            slots.append(("valu", ("<", v_tmp1, vi0, v_n_nodes)))
-            slots.append(("valu", ("<", v_tmp2, vi1, v_n_nodes)))
-            slots.append(("valu", ("<", v_tmp3, vi2, v_n_nodes)))
-            slots.append(("valu", ("<", v_tmp4, vi3, v_n_nodes)))
-            slots.append(("valu", ("*", vi0, vi0, v_tmp1)))
-            slots.append(("valu", ("*", vi1, vi1, v_tmp2)))
-            slots.append(("valu", ("*", vi2, vi2, v_tmp3)))
-            slots.append(("valu", ("*", vi3, vi3, v_tmp4)))
+            target.append(("valu", ("<", v_tmp1, vi0, v_n_nodes)))
+            target.append(("valu", ("<", v_tmp2, vi1, v_n_nodes)))
+            target.append(("valu", ("<", v_tmp3, vi2, v_n_nodes)))
+            target.append(("valu", ("<", v_tmp4, vi3, v_n_nodes)))
+            target.append(("valu", ("*", vi0, vi0, v_tmp1)))
+            target.append(("valu", ("*", vi1, vi1, v_tmp2)))
+            target.append(("valu", ("*", vi2, vi2, v_tmp3)))
+            target.append(("valu", ("*", vi3, vi3, v_tmp4)))
 
         # Process 4 vectors (quad) at a time for round 0
         for v in range(0, n_vecs, 4):
@@ -537,32 +541,60 @@ class KernelBuilder:
             slots.append(("valu", ("*", vi1, vi1, v_tmp4)))
 
         def emit_scatter_round():
-            """Generate one round of scatter with pipelined loads + compute."""
+            """Generate one round of scatter with overlapped loads + compute."""
             nonlocal slots
-            # Load ALL tree values for all 32 vectors first
-            for v in range(n_vecs):
-                vi = all_idx + v * VLEN
-                tree_dest = all_tree + v * VLEN
-                for i in range(8):
-                    slots.append(("alu", ("+", addrs[i], self.scratch["forest_values_p"], vi + i)))
-                for i in range(8):
-                    slots.append(("load", ("load", tree_dest + i, addrs[i])))
 
-            # Compute on all 32 vectors
-            for v in range(0, n_vecs, 4):
+            def interleave_slots(load_slots, compute_slots):
+                li = 0
+                ci = 0
+                while li < len(load_slots) or ci < len(compute_slots):
+                    for _ in range(SLOT_LIMITS["load"]):
+                        if li < len(load_slots):
+                            slots.append(load_slots[li])
+                            li += 1
+                    for _ in range(SLOT_LIMITS["valu"]):
+                        if ci < len(compute_slots):
+                            slots.append(compute_slots[ci])
+                            ci += 1
+
+            def load_slots_for_quad(v):
+                load_slots = []
+                for k in range(4):
+                    vi = all_idx + (v + k) * VLEN
+                    tree_dest = all_tree + (v + k) * VLEN
+                    for i in range(8):
+                        load_slots.append(
+                            ("alu", ("+", addrs[i], self.scratch["forest_values_p"], vi + i))
+                        )
+                    for i in range(8):
+                        load_slots.append(("load", ("load", tree_dest + i, addrs[i])))
+                return load_slots
+
+            def compute_slots_for_quad(v):
+                compute_slots = []
                 vi0, vv0, tv0 = all_idx + v * VLEN, all_val + v * VLEN, all_tree + v * VLEN
-                vi1, vv1, tv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN, all_tree + (v+1) * VLEN
-                vi2, vv2, tv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN, all_tree + (v+2) * VLEN
-                vi3, vv3, tv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN, all_tree + (v+3) * VLEN
-                # XOR
-                slots.append(("valu", ("^", vv0, vv0, tv0)))
-                slots.append(("valu", ("^", vv1, vv1, tv1)))
-                slots.append(("valu", ("^", vv2, vv2, tv2)))
-                slots.append(("valu", ("^", vv3, vv3, tv3)))
-                # Hash with multiply_add
-                emit_hash_quad(vv0, vv1, vv2, vv3)
-                # Idx update
-                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
+                vi1, vv1, tv1 = all_idx + (v + 1) * VLEN, all_val + (v + 1) * VLEN, all_tree + (v + 1) * VLEN
+                vi2, vv2, tv2 = all_idx + (v + 2) * VLEN, all_val + (v + 2) * VLEN, all_tree + (v + 2) * VLEN
+                vi3, vv3, tv3 = all_idx + (v + 3) * VLEN, all_val + (v + 3) * VLEN, all_tree + (v + 3) * VLEN
+                compute_slots.append(("valu", ("^", vv0, vv0, tv0)))
+                compute_slots.append(("valu", ("^", vv1, vv1, tv1)))
+                compute_slots.append(("valu", ("^", vv2, vv2, tv2)))
+                compute_slots.append(("valu", ("^", vv3, vv3, tv3)))
+                emit_hash_quad(vv0, vv1, vv2, vv3, target=compute_slots)
+                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=compute_slots)
+                return compute_slots
+
+            prev_compute = None
+            for v in range(0, n_vecs, 4):
+                load_slots = load_slots_for_quad(v)
+                if prev_compute is None:
+                    slots.extend(load_slots)
+                else:
+                    interleave_slots(load_slots, prev_compute)
+                prev_compute = compute_slots_for_quad(v)
+
+            if prev_compute is not None:
+                slots.extend(prev_compute)
 
         def emit_broadcast_round():
             """Round where all idx=0, use broadcast with multiply_add optimization."""
@@ -683,12 +715,10 @@ class KernelBuilder:
         self.instrs.extend(self.build(slots))
         slots = []
 
-        # === STORE all idx/val back to memory ===
+        # === STORE all val back to memory ===
         for v in range(n_vecs):
             off = self.scratch_const(VLEN * v)
-            slots.append(("alu", ("+", addr0, self.scratch["inp_indices_p"], off)))
             slots.append(("alu", ("+", addr1, self.scratch["inp_values_p"], off)))
-            slots.append(("store", ("vstore", addr0, all_idx + v * VLEN)))
             slots.append(("store", ("vstore", addr1, all_val + v * VLEN)))
 
         self.instrs.extend(self.build(slots))
