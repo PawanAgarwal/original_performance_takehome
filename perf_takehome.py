@@ -537,10 +537,10 @@ class KernelBuilder:
             slots.append(("valu", ("*", vi1, vi1, v_tmp4)))
 
         def emit_scatter_round():
-            """Generate one round of scatter with fine-grained interleaved loads + compute."""
+            """Generate one round of scatter with pipelined loads + compute."""
             nonlocal slots
-            # Prolog: Load tree values for vectors 0-3
-            for v in range(4):
+            # Load ALL tree values for all 32 vectors first
+            for v in range(n_vecs):
                 vi = all_idx + v * VLEN
                 tree_dest = all_tree + v * VLEN
                 for i in range(8):
@@ -548,99 +548,21 @@ class KernelBuilder:
                 for i in range(8):
                     slots.append(("load", ("load", tree_dest + i, addrs[i])))
 
-            # Main loop: Fine-grained interleaving of compute and loads
-            # For each group of 4 vectors, interleave hash stages with loads for next group
-            for v in range(0, n_vecs - 4, 4):
-                vi0 = all_idx + v * VLEN
-                vv0 = all_val + v * VLEN
-                tv0 = all_tree + v * VLEN
-                vi1 = all_idx + (v + 1) * VLEN
-                vv1 = all_val + (v + 1) * VLEN
-                tv1 = all_tree + (v + 1) * VLEN
-                vi2 = all_idx + (v + 2) * VLEN
-                vv2 = all_val + (v + 2) * VLEN
-                tv2 = all_tree + (v + 2) * VLEN
-                vi3 = all_idx + (v + 3) * VLEN
-                vv3 = all_val + (v + 3) * VLEN
-                tv3 = all_tree + (v + 3) * VLEN
-
+            # Compute on all 32 vectors
+            for v in range(0, n_vecs, 4):
+                vi0, vv0, tv0 = all_idx + v * VLEN, all_val + v * VLEN, all_tree + v * VLEN
+                vi1, vv1, tv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN, all_tree + (v+1) * VLEN
+                vi2, vv2, tv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN, all_tree + (v+2) * VLEN
+                vi3, vv3, tv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN, all_tree + (v+3) * VLEN
                 # XOR
                 slots.append(("valu", ("^", vv0, vv0, tv0)))
                 slots.append(("valu", ("^", vv1, vv1, tv1)))
                 slots.append(("valu", ("^", vv2, vv2, tv2)))
                 slots.append(("valu", ("^", vv3, vv3, tv3)))
-
-                # Interleave hash stages with loads for next 4 vectors
-                load_vec_idx = 0
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    vc1, vc3 = v_hash_consts[hi]
-                    if v_hash_mults[hi] is not None:
-                        _, vm, _ = v_hash_mults[hi]
-                        slots.append(("valu", ("multiply_add", vv0, vv0, vm, vc1)))
-                        slots.append(("valu", ("multiply_add", vv1, vv1, vm, vc1)))
-                        slots.append(("valu", ("multiply_add", vv2, vv2, vm, vc1)))
-                        slots.append(("valu", ("multiply_add", vv3, vv3, vm, vc1)))
-                    else:
-                        slots.append(("valu", (op1, v_tmp1, vv0, vc1)))
-                        slots.append(("valu", (op3, v_tmp2, vv0, vc3)))
-                        slots.append(("valu", (op1, v_tmp3, vv1, vc1)))
-                        slots.append(("valu", (op3, v_tmp4, vv1, vc3)))
-                        slots.append(("valu", (op1, v_tmp5, vv2, vc1)))
-                        slots.append(("valu", (op3, v_tmp6, vv2, vc3)))
-                        slots.append(("valu", (op1, v_tmp7, vv3, vc1)))
-                        slots.append(("valu", (op3, v_tmp8, vv3, vc3)))
-                        slots.append(("valu", (op2, vv0, v_tmp1, v_tmp2)))
-                        slots.append(("valu", (op2, vv1, v_tmp3, v_tmp4)))
-                        slots.append(("valu", (op2, vv2, v_tmp5, v_tmp6)))
-                        slots.append(("valu", (op2, vv3, v_tmp7, v_tmp8)))
-
-                    # Interleave loads: compute addresses and issue loads
-                    if load_vec_idx < 4:
-                        vn = v + 4 + load_vec_idx
-                        if vn < n_vecs:
-                            vi_next = all_idx + vn * VLEN
-                            tree_dest = all_tree + vn * VLEN
-                            for i in range(8):
-                                slots.append(("alu", ("+", addrs[i], self.scratch["forest_values_p"], vi_next + i)))
-                            for i in range(8):
-                                slots.append(("load", ("load", tree_dest + i, addrs[i])))
-                        load_vec_idx += 1
-
-                # Index update
+                # Hash with multiply_add
+                emit_hash_quad(vv0, vv1, vv2, vv3)
+                # Idx update
                 emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
-
-                # Load remaining vectors if not all loaded during hash
-                while load_vec_idx < 4:
-                    vn = v + 4 + load_vec_idx
-                    if vn < n_vecs:
-                        vi_next = all_idx + vn * VLEN
-                        tree_dest = all_tree + vn * VLEN
-                        for i in range(8):
-                            slots.append(("alu", ("+", addrs[i], self.scratch["forest_values_p"], vi_next + i)))
-                        for i in range(8):
-                            slots.append(("load", ("load", tree_dest + i, addrs[i])))
-                    load_vec_idx += 1
-
-            # Epilog: Compute on last 4 vectors (28-31)
-            v = n_vecs - 4
-            vi0 = all_idx + v * VLEN
-            vv0 = all_val + v * VLEN
-            tv0 = all_tree + v * VLEN
-            vi1 = all_idx + (v + 1) * VLEN
-            vv1 = all_val + (v + 1) * VLEN
-            tv1 = all_tree + (v + 1) * VLEN
-            vi2 = all_idx + (v + 2) * VLEN
-            vv2 = all_val + (v + 2) * VLEN
-            tv2 = all_tree + (v + 2) * VLEN
-            vi3 = all_idx + (v + 3) * VLEN
-            vv3 = all_val + (v + 3) * VLEN
-            tv3 = all_tree + (v + 3) * VLEN
-            slots.append(("valu", ("^", vv0, vv0, tv0)))
-            slots.append(("valu", ("^", vv1, vv1, tv1)))
-            slots.append(("valu", ("^", vv2, vv2, tv2)))
-            slots.append(("valu", ("^", vv3, vv3, tv3)))
-            emit_hash_quad(vv0, vv1, vv2, vv3)
-            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3)
 
         def emit_broadcast_round():
             """Round where all idx=0, use broadcast with multiply_add optimization."""
