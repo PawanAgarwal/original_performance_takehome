@@ -629,50 +629,55 @@ class KernelBuilder:
                 emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=compute_ops)
                 quad_compute_ops.append(compute_ops)
 
-            # Triple pipeline: addr[q] | load[q-1] | compute[q-2]
-            # Phase 0: addr[0]
+            # Optimized pipelining: emit operations in ideal cycle-sized chunks
+            # Target: each cycle should have 2 loads + 6 valu + addr ops (different engines)
+
+            # Phase 0: addr[0] only (no loads or compute yet)
             for op in quad_addr_ops[0]:
                 slots.append(op)
 
-            # Phase 1: interleave addr[1] with load[0]
+            # Phase 1: addr[1] interleaved with load[0] (no compute yet)
+            # Emit in fine-grained manner: 2 addr + 2 load per "cycle" to encourage packing
             ai, li = 0, 0
             while ai < len(quad_addr_ops[1]) or li < len(quad_load_ops[0]):
-                # Emit addr ops (up to 12 per cycle, but we have 32, so ~3 cycles)
-                for _ in range(12):
-                    if ai < len(quad_addr_ops[1]):
-                        slots.append(quad_addr_ops[1][ai])
-                        ai += 1
-                # Emit load ops (2 per cycle)
+                # 2 loads first (they use addresses from phase 0)
                 for _ in range(2):
                     if li < len(quad_load_ops[0]):
                         slots.append(quad_load_ops[0][li])
                         li += 1
+                # 2 addr ops (for next phase's loads)
+                for _ in range(2):
+                    if ai < len(quad_addr_ops[1]):
+                        slots.append(quad_addr_ops[1][ai])
+                        ai += 1
 
-            # Phases 2 to n_quads-1: interleave addr[q], load[q-1], compute[q-2]
+            # Phases 2 to n_quads-1: full triple pipeline
             for q in range(2, n_quads):
                 ai, li, ci = 0, 0, 0
                 addr_ops = quad_addr_ops[q]
                 load_ops = quad_load_ops[q-1]
                 compute_ops = quad_compute_ops[q-2]
-                # Interleave all three - addr uses ALU, load uses load slots, compute uses valu
+
+                # Fine-grained interleave: emit in cycle-sized chunks
+                # Target cycle: 2 loads + 6 valu + 2 addr
                 while ai < len(addr_ops) or li < len(load_ops) or ci < len(compute_ops):
-                    # Emit addr ops (batch of up to 12)
-                    for _ in range(12):
-                        if ai < len(addr_ops):
-                            slots.append(addr_ops[ai])
-                            ai += 1
-                    # Emit load ops (2 per cycle)
+                    # Loads first (using addresses from previous phase)
                     for _ in range(2):
                         if li < len(load_ops):
                             slots.append(load_ops[li])
                             li += 1
-                    # Emit compute ops (6 per cycle)
+                    # Then valu ops (can pack with loads)
                     for _ in range(6):
                         if ci < len(compute_ops):
                             slots.append(compute_ops[ci])
                             ci += 1
+                    # Then addr ops (can pack with both, uses ALU not load/valu)
+                    for _ in range(2):
+                        if ai < len(addr_ops):
+                            slots.append(addr_ops[ai])
+                            ai += 1
 
-            # Phase n_quads: load[n_quads-1] interleaved with compute[n_quads-2]
+            # Phase n_quads: load[n_quads-1] + compute[n_quads-2]
             li, ci = 0, 0
             load_ops = quad_load_ops[n_quads-1]
             compute_ops = quad_compute_ops[n_quads-2]
@@ -686,7 +691,7 @@ class KernelBuilder:
                         slots.append(compute_ops[ci])
                         ci += 1
 
-            # Final phase: compute[n_quads-1]
+            # Final phase: compute[n_quads-1] only
             for op in quad_compute_ops[n_quads-1]:
                 slots.append(op)
 
