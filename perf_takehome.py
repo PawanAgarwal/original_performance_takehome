@@ -253,14 +253,11 @@ class KernelBuilder:
         v_nv2 = self.alloc_scratch("v_nv2", VLEN)            # tree vals for vec 2
         v_nv3 = self.alloc_scratch("v_nv3", VLEN)            # tree vals for vec 3
 
-        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
-        v_tmp4 = self.alloc_scratch("v_tmp4", VLEN)
-        v_tmp5 = self.alloc_scratch("v_tmp5", VLEN)
-        v_tmp6 = self.alloc_scratch("v_tmp6", VLEN)
-        v_tmp7 = self.alloc_scratch("v_tmp7", VLEN)
-        v_tmp8 = self.alloc_scratch("v_tmp8", VLEN)
+        # Temp vectors - allocate more for interleaved hash operations
+        # We need 2 temps per vector, so 16 temps allows 8-vector interleaving
+        v_tmp = [self.alloc_scratch(f"v_tmp{i}", VLEN) for i in range(16)]
+        v_tmp1, v_tmp2, v_tmp3, v_tmp4 = v_tmp[0], v_tmp[1], v_tmp[2], v_tmp[3]
+        v_tmp5, v_tmp6, v_tmp7, v_tmp8 = v_tmp[4], v_tmp[5], v_tmp[6], v_tmp[7]
 
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
@@ -329,15 +326,40 @@ class KernelBuilder:
                 cm = self.scratch_const(mult_val)
                 slots.append(("valu", ("vbroadcast", vm, cm)))
 
-        # Load all values from memory into scratch
+        # Load all values from memory into scratch - optimized
+        # First compute all 32 addresses (can pack at 12 alu/cycle)
+        # Use addr bank registers to hold addresses
+        all_val_addrs = []
+        for v in range(n_vecs):
+            if v < 8:
+                all_val_addrs.append(addrs[v])
+            elif v < 16:
+                all_val_addrs.append(addrs_bank1[v - 8])
+            elif v < 24:
+                all_val_addrs.append(addrs_bank2[v - 16])
+            else:
+                all_val_addrs.append(addrs_bank3[v - 24])
+
+        # Compute all addresses first (12 alu/cycle = 3 cycles for 32 ops)
         for v in range(n_vecs):
             off = self.scratch_const(VLEN * v)
-            slots.append(("alu", ("+", addr0, self.scratch["inp_values_p"], off)))
-            slots.append(("load", ("vload", all_val + v * VLEN, addr0)))
+            slots.append(("alu", ("+", all_val_addrs[v], self.scratch["inp_values_p"], off)))
 
-        # Initialize all idx to 0
-        for v in range(n_vecs):
-            slots.append(("valu", ("+", all_idx + v * VLEN, v_zero, v_zero)))
+        # Now do vloads (2/cycle = 16 cycles) interleaved with idx init (6/cycle)
+        # This allows vloads and valu to run in parallel
+        vload_idx = 0
+        idx_init_idx = 0
+        while vload_idx < n_vecs or idx_init_idx < n_vecs:
+            # 2 vloads per chunk
+            for _ in range(2):
+                if vload_idx < n_vecs:
+                    slots.append(("load", ("vload", all_val + vload_idx * VLEN, all_val_addrs[vload_idx])))
+                    vload_idx += 1
+            # 6 idx inits per chunk (can pack with vloads since different engines)
+            for _ in range(6):
+                if idx_init_idx < n_vecs:
+                    slots.append(("valu", ("+", all_idx + idx_init_idx * VLEN, v_zero, v_zero)))
+                    idx_init_idx += 1
 
         self.instrs.extend(self.build(slots))
         slots = []
@@ -377,6 +399,66 @@ class KernelBuilder:
                     target.append(("valu", (op2, vv2, v_tmp5, v_tmp6)))
                     target.append(("valu", (op2, vv3, v_tmp7, v_tmp8)))
 
+        # Helper: emit interleaved hash for 8 vectors (2 quads) to maximize VALU packing
+        # By interleaving temp ops from 2 quads, we can fill cycles where single quad
+        # would have only 2-4 ops due to dependency chains.
+        def emit_hash_octet(vecs, target=None):
+            """Process 8 vectors with interleaved hash operations.
+
+            For non-multiply_add stages, the dependency chain is:
+            t1,t2 -> c0, t3,t4 -> c1, t5,t6 -> c2, t7,t8 -> c3
+
+            Single quad gives: t1-t6 (6) | t7,t8 (2) | c0-c3 (4) = 12 ops in 3 cycles
+            Two quads interleaved gives:
+            Qa.t1-t6 (6) | Qa.t7,t8 + Qb.t1-t4 (6) | Qb.t5-t8 + Qa.c0,c1 (6) |
+            Qa.c2,c3 + Qb.c0-c2 (5) | Qb.c3 + next stage ops
+            """
+            if target is None:
+                target = slots
+            vv = vecs  # list of 8 val vectors
+            # Temp assignments: use v_tmp[0:8] for quad A, v_tmp[8:16] for quad B
+            # Quad A: vecs 0-3 use temps 0-7
+            # Quad B: vecs 4-7 use temps 8-15
+
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                vc1, vc3 = v_hash_consts[hi]
+                if v_hash_mults[hi] is not None:
+                    # multiply_add stages: 8 independent ops, perfect packing
+                    _, vm, _ = v_hash_mults[hi]
+                    for i in range(8):
+                        target.append(("valu", ("multiply_add", vv[i], vv[i], vm, vc1)))
+                else:
+                    # Interleaved temp+combine stages
+                    # Phase 1: Qa.t0-5 (6 ops)
+                    target.append(("valu", (op1, v_tmp[0], vv[0], vc1)))
+                    target.append(("valu", (op3, v_tmp[1], vv[0], vc3)))
+                    target.append(("valu", (op1, v_tmp[2], vv[1], vc1)))
+                    target.append(("valu", (op3, v_tmp[3], vv[1], vc3)))
+                    target.append(("valu", (op1, v_tmp[4], vv[2], vc1)))
+                    target.append(("valu", (op3, v_tmp[5], vv[2], vc3)))
+                    # Phase 2: Qa.t6,t7 + Qb.t0-3 (6 ops)
+                    target.append(("valu", (op1, v_tmp[6], vv[3], vc1)))
+                    target.append(("valu", (op3, v_tmp[7], vv[3], vc3)))
+                    target.append(("valu", (op1, v_tmp[8], vv[4], vc1)))
+                    target.append(("valu", (op3, v_tmp[9], vv[4], vc3)))
+                    target.append(("valu", (op1, v_tmp[10], vv[5], vc1)))
+                    target.append(("valu", (op3, v_tmp[11], vv[5], vc3)))
+                    # Phase 3: Qb.t4-7 + Qa.c0,c1 (6 ops)
+                    target.append(("valu", (op1, v_tmp[12], vv[6], vc1)))
+                    target.append(("valu", (op3, v_tmp[13], vv[6], vc3)))
+                    target.append(("valu", (op1, v_tmp[14], vv[7], vc1)))
+                    target.append(("valu", (op3, v_tmp[15], vv[7], vc3)))
+                    target.append(("valu", (op2, vv[0], v_tmp[0], v_tmp[1])))
+                    target.append(("valu", (op2, vv[1], v_tmp[2], v_tmp[3])))
+                    # Phase 4: Qa.c2,c3 + Qb.c0-c2 (5 ops) - small gap OK
+                    target.append(("valu", (op2, vv[2], v_tmp[4], v_tmp[5])))
+                    target.append(("valu", (op2, vv[3], v_tmp[6], v_tmp[7])))
+                    target.append(("valu", (op2, vv[4], v_tmp[8], v_tmp[9])))
+                    target.append(("valu", (op2, vv[5], v_tmp[10], v_tmp[11])))
+                    target.append(("valu", (op2, vv[6], v_tmp[12], v_tmp[13])))
+                    # Phase 5: Qb.c3 - will pack with next stage's ops
+                    target.append(("valu", (op2, vv[7], v_tmp[14], v_tmp[15])))
+
         # Helper: emit index update for 4 vectors (quad) using multiply_add
         def emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=None, check_wrap=True):
             if target is None:
@@ -408,19 +490,37 @@ class KernelBuilder:
                 target.append(("valu", ("*", vi2, vi2, v_tmp3)))
                 target.append(("valu", ("*", vi3, vi3, v_tmp4)))
 
-        # Process 4 vectors (quad) at a time for round 0
+        # Helper: emit index update for 8 vectors (octet) - better VALU packing
+        def emit_idx_octet(idx_vecs, val_vecs, target=None, check_wrap=True):
+            if target is None:
+                target = slots
+            vi, vv = idx_vecs, val_vecs
+            # bit = hash % 2 for all 8
+            for i in range(8):
+                target.append(("valu", ("%", v_tmp[i], vv[i], v_two)))
+            # bit_plus_one = bit + 1
+            for i in range(8):
+                target.append(("valu", ("+", v_tmp[i], v_tmp[i], v_one)))
+            # idx = idx * 2 + bit_plus_one (using multiply_add)
+            for i in range(8):
+                target.append(("valu", ("multiply_add", vi[i], vi[i], v_two, v_tmp[i])))
+            # wrapping check if needed
+            if check_wrap:
+                for i in range(8):
+                    target.append(("valu", ("<", v_tmp[i], vi[i], v_n_nodes)))
+                for i in range(8):
+                    target.append(("valu", ("*", vi[i], vi[i], v_tmp[i])))
+
+        # Process 8 vectors (octet) at a time for round 0 - better VALU packing
         # No wrap check needed - idx goes from 0 to {1,2}
-        for v in range(0, n_vecs, 4):
-            vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
-            vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
-            vi2, vv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN
-            vi3, vv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN
-            slots.append(("valu", ("^", vv0, vv0, v_node_val)))
-            slots.append(("valu", ("^", vv1, vv1, v_node_val)))
-            slots.append(("valu", ("^", vv2, vv2, v_node_val)))
-            slots.append(("valu", ("^", vv3, vv3, v_node_val)))
-            emit_hash_quad(vv0, vv1, vv2, vv3)
-            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, check_wrap=False)
+        for v in range(0, n_vecs, 8):
+            idx_vecs = [all_idx + (v+i) * VLEN for i in range(8)]
+            val_vecs = [all_val + (v+i) * VLEN for i in range(8)]
+            # XOR with node value
+            for vv in val_vecs:
+                slots.append(("valu", ("^", vv, vv, v_node_val)))
+            emit_hash_octet(val_vecs)
+            emit_idx_octet(idx_vecs, val_vecs, check_wrap=False)
 
         self.instrs.extend(self.build(slots))
         slots = []
@@ -444,32 +544,28 @@ class KernelBuilder:
         slots.append(("valu", ("vbroadcast", v_tree1, tree_scalar)))
         slots.append(("valu", ("vbroadcast", v_tree_diff, tree_scalar2)))
 
-        # Process 4 vectors at a time with multiply_add
-        for v in range(0, n_vecs, 4):
-            vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
-            vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
-            vi2, vv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN
-            vi3, vv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN
-            # Compute tree values for 4 vectors
-            slots.append(("valu", ("-", v_node_val, vi0, v_one)))
-            slots.append(("valu", ("-", v_nv1, vi1, v_one)))
-            slots.append(("valu", ("-", v_nv2, vi2, v_one)))
-            slots.append(("valu", ("-", v_nv3, vi3, v_one)))
-            slots.append(("valu", ("*", v_node_val, v_node_val, v_tree_diff)))
-            slots.append(("valu", ("*", v_nv1, v_nv1, v_tree_diff)))
-            slots.append(("valu", ("*", v_nv2, v_nv2, v_tree_diff)))
-            slots.append(("valu", ("*", v_nv3, v_nv3, v_tree_diff)))
-            slots.append(("valu", ("+", v_node_val, v_node_val, v_tree1)))
-            slots.append(("valu", ("+", v_nv1, v_nv1, v_tree1)))
-            slots.append(("valu", ("+", v_nv2, v_nv2, v_tree1)))
-            slots.append(("valu", ("+", v_nv3, v_nv3, v_tree1)))
-            slots.append(("valu", ("^", vv0, vv0, v_node_val)))
-            slots.append(("valu", ("^", vv1, vv1, v_nv1)))
-            slots.append(("valu", ("^", vv2, vv2, v_nv2)))
-            slots.append(("valu", ("^", vv3, vv3, v_nv3)))
-            emit_hash_quad(vv0, vv1, vv2, vv3)
+        # Allocate more tree value vectors for 8-vector processing
+        v_nv = [v_node_val, v_nv1, v_nv2, v_nv3]
+        for i in range(4, 8):
+            v_nv.append(self.alloc_scratch(f"v_nv{i}", VLEN))
+
+        # Process 8 vectors at a time - better VALU packing
+        for v in range(0, n_vecs, 8):
+            idx_vecs = [all_idx + (v+i) * VLEN for i in range(8)]
+            val_vecs = [all_val + (v+i) * VLEN for i in range(8)]
+            # Compute tree values for 8 vectors: tree[idx] = tree[1] + (idx-1)*(tree[2]-tree[1])
+            for i in range(8):
+                slots.append(("valu", ("-", v_nv[i], idx_vecs[i], v_one)))
+            for i in range(8):
+                slots.append(("valu", ("*", v_nv[i], v_nv[i], v_tree_diff)))
+            for i in range(8):
+                slots.append(("valu", ("+", v_nv[i], v_nv[i], v_tree1)))
+            # XOR
+            for i in range(8):
+                slots.append(("valu", ("^", val_vecs[i], val_vecs[i], v_nv[i])))
+            emit_hash_octet(val_vecs)
             # No wrap check - idx goes from {1,2} to {3,4,5,6}
-            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, check_wrap=False)
+            emit_idx_octet(idx_vecs, val_vecs, check_wrap=False)
 
         self.instrs.extend(self.build(slots))
         slots = []
@@ -527,24 +623,23 @@ class KernelBuilder:
             slots.append(("flow", ("vselect", v_tmp4, v_tmp5, v_t6, v_t5)))
             slots.append(("flow", ("vselect", result1, v_tmp6, v_tmp4, result1)))
 
-        # Process 4 vectors at a time with multiply_add for hash
-        for v in range(0, n_vecs, 4):
-            vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
-            vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
-            vi2, vv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN
-            vi3, vv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN
+        # Process 8 vectors at a time with interleaved hash - better VALU packing
+        for v in range(0, n_vecs, 8):
+            idx_vecs = [all_idx + (v+i) * VLEN for i in range(8)]
+            val_vecs = [all_val + (v+i) * VLEN for i in range(8)]
             # Vselect for tree lookup - 2 pairs at a time (flow slot limited)
-            emit_vselect_lookup_pair(vi0, vi1, v_node_val, v_nv1)
-            emit_vselect_lookup_pair(vi2, vi3, v_nv2, v_nv3)
+            # Store results in v_nv[0:8]
+            emit_vselect_lookup_pair(idx_vecs[0], idx_vecs[1], v_nv[0], v_nv[1])
+            emit_vselect_lookup_pair(idx_vecs[2], idx_vecs[3], v_nv[2], v_nv[3])
+            emit_vselect_lookup_pair(idx_vecs[4], idx_vecs[5], v_nv[4], v_nv[5])
+            emit_vselect_lookup_pair(idx_vecs[6], idx_vecs[7], v_nv[6], v_nv[7])
             # XOR
-            slots.append(("valu", ("^", vv0, vv0, v_node_val)))
-            slots.append(("valu", ("^", vv1, vv1, v_nv1)))
-            slots.append(("valu", ("^", vv2, vv2, v_nv2)))
-            slots.append(("valu", ("^", vv3, vv3, v_nv3)))
-            # Hash and idx update with multiply_add
-            emit_hash_quad(vv0, vv1, vv2, vv3)
+            for i in range(8):
+                slots.append(("valu", ("^", val_vecs[i], val_vecs[i], v_nv[i])))
+            # Hash and idx update - 8-vector interleaved
+            emit_hash_octet(val_vecs)
             # No wrap check - idx goes from {3-6} to {7-14}
-            emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, check_wrap=False)
+            emit_idx_octet(idx_vecs, val_vecs, check_wrap=False)
 
         self.instrs.extend(self.build(slots))
         slots = []
@@ -636,23 +731,22 @@ class KernelBuilder:
                 emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=compute_ops, check_wrap=check_wrap)
                 quad_compute_ops.append(compute_ops)
 
-            # Optimized pipelining: emit operations in ideal cycle-sized chunks
-            # Target: each cycle should have 2 loads + 6 valu + addr ops (different engines)
+            # Fine-grained pipelining: emit operations interleaved to maximize packing
+            # Pipeline: addr[q] | load[q-1] | compute[q-2]
+            # Key: emit in small chunks (2 load, 6 valu, 2 alu) so loads can pack
+            # with valu instructions when valu-valu dependencies force flushes.
 
             # Phase 0: addr[0] only (no loads or compute yet)
             for op in quad_addr_ops[0]:
                 slots.append(op)
 
             # Phase 1: addr[1] interleaved with load[0] (no compute yet)
-            # Emit in fine-grained manner: 2 addr + 2 load per "cycle" to encourage packing
             ai, li = 0, 0
             while ai < len(quad_addr_ops[1]) or li < len(quad_load_ops[0]):
-                # 2 loads first (they use addresses from phase 0)
                 for _ in range(2):
                     if li < len(quad_load_ops[0]):
                         slots.append(quad_load_ops[0][li])
                         li += 1
-                # 2 addr ops (for next phase's loads)
                 for _ in range(2):
                     if ai < len(quad_addr_ops[1]):
                         slots.append(quad_addr_ops[1][ai])
@@ -665,20 +759,16 @@ class KernelBuilder:
                 load_ops = quad_load_ops[q-1]
                 compute_ops = quad_compute_ops[q-2]
 
-                # Fine-grained interleave: emit in cycle-sized chunks
-                # Target cycle: 2 loads + 6 valu + 2 addr
+                # Fine-grained interleave: 2 loads + 6 valu + 2 addr per chunk
                 while ai < len(addr_ops) or li < len(load_ops) or ci < len(compute_ops):
-                    # Loads first (using addresses from previous phase)
                     for _ in range(2):
                         if li < len(load_ops):
                             slots.append(load_ops[li])
                             li += 1
-                    # Then valu ops (can pack with loads)
                     for _ in range(6):
                         if ci < len(compute_ops):
                             slots.append(compute_ops[ci])
                             ci += 1
-                    # Then addr ops (can pack with both, uses ALU not load/valu)
                     for _ in range(2):
                         if ai < len(addr_ops):
                             slots.append(addr_ops[ai])
@@ -703,26 +793,22 @@ class KernelBuilder:
                 slots.append(op)
 
         def emit_broadcast_round():
-            """Round where all idx=0, use broadcast with multiply_add optimization."""
+            """Round where all idx=0, use broadcast with 8-vector interleaved hash."""
             nonlocal slots
             slots.append(("alu", ("+", addr0, self.scratch["forest_values_p"], zero_const)))
             slots.append(("load", ("load", tree_scalar, addr0)))
             slots.append(("valu", ("vbroadcast", v_node_val, tree_scalar)))
-            # Process 4 vectors at a time with multiply_add
-            for v in range(0, n_vecs, 4):
-                vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
-                vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
-                vi2, vv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN
-                vi3, vv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN
-                slots.append(("valu", ("^", vv0, vv0, v_node_val)))
-                slots.append(("valu", ("^", vv1, vv1, v_node_val)))
-                slots.append(("valu", ("^", vv2, vv2, v_node_val)))
-                slots.append(("valu", ("^", vv3, vv3, v_node_val)))
-                emit_hash_quad(vv0, vv1, vv2, vv3)
-                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, check_wrap=False)
+            # Process 8 vectors at a time for better VALU packing
+            for v in range(0, n_vecs, 8):
+                idx_vecs = [all_idx + (v+i) * VLEN for i in range(8)]
+                val_vecs = [all_val + (v+i) * VLEN for i in range(8)]
+                for vv in val_vecs:
+                    slots.append(("valu", ("^", vv, vv, v_node_val)))
+                emit_hash_octet(val_vecs)
+                emit_idx_octet(idx_vecs, val_vecs, check_wrap=False)
 
         def emit_arith_round():
-            """Round where idx in {1,2}, use arithmetic with multiply_add."""
+            """Round where idx in {1,2}, use arithmetic with 8-vector interleaved hash."""
             nonlocal slots
             slots.append(("alu", ("+", addr0, self.scratch["forest_values_p"], c1_const)))
             slots.append(("alu", ("+", addr1, self.scratch["forest_values_p"], c2_const)))
@@ -731,34 +817,24 @@ class KernelBuilder:
             slots.append(("alu", ("-", tree_scalar2, tree_scalar2, tree_scalar)))
             slots.append(("valu", ("vbroadcast", v_tree1, tree_scalar)))
             slots.append(("valu", ("vbroadcast", v_tree_diff, tree_scalar2)))
-            # Process 4 vectors at a time
-            for v in range(0, n_vecs, 4):
-                vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
-                vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
-                vi2, vv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN
-                vi3, vv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN
-                # Compute tree values for 4 vectors
-                slots.append(("valu", ("-", v_node_val, vi0, v_one)))
-                slots.append(("valu", ("-", v_nv1, vi1, v_one)))
-                slots.append(("valu", ("-", v_nv2, vi2, v_one)))
-                slots.append(("valu", ("-", v_nv3, vi3, v_one)))
-                slots.append(("valu", ("*", v_node_val, v_node_val, v_tree_diff)))
-                slots.append(("valu", ("*", v_nv1, v_nv1, v_tree_diff)))
-                slots.append(("valu", ("*", v_nv2, v_nv2, v_tree_diff)))
-                slots.append(("valu", ("*", v_nv3, v_nv3, v_tree_diff)))
-                slots.append(("valu", ("+", v_node_val, v_node_val, v_tree1)))
-                slots.append(("valu", ("+", v_nv1, v_nv1, v_tree1)))
-                slots.append(("valu", ("+", v_nv2, v_nv2, v_tree1)))
-                slots.append(("valu", ("+", v_nv3, v_nv3, v_tree1)))
-                slots.append(("valu", ("^", vv0, vv0, v_node_val)))
-                slots.append(("valu", ("^", vv1, vv1, v_nv1)))
-                slots.append(("valu", ("^", vv2, vv2, v_nv2)))
-                slots.append(("valu", ("^", vv3, vv3, v_nv3)))
-                emit_hash_quad(vv0, vv1, vv2, vv3)
-                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, check_wrap=False)
+            # Process 8 vectors at a time for better VALU packing
+            for v in range(0, n_vecs, 8):
+                idx_vecs = [all_idx + (v+i) * VLEN for i in range(8)]
+                val_vecs = [all_val + (v+i) * VLEN for i in range(8)]
+                # Compute tree values for 8 vectors
+                for i in range(8):
+                    slots.append(("valu", ("-", v_nv[i], idx_vecs[i], v_one)))
+                for i in range(8):
+                    slots.append(("valu", ("*", v_nv[i], v_nv[i], v_tree_diff)))
+                for i in range(8):
+                    slots.append(("valu", ("+", v_nv[i], v_nv[i], v_tree1)))
+                for i in range(8):
+                    slots.append(("valu", ("^", val_vecs[i], val_vecs[i], v_nv[i])))
+                emit_hash_octet(val_vecs)
+                emit_idx_octet(idx_vecs, val_vecs, check_wrap=False)
 
         def emit_vselect_round():
-            """Round where idx in {3-6}, use vselect with multiply_add for hash."""
+            """Round where idx in {3-6}, use vselect with 8-vector interleaved hash."""
             nonlocal slots
             slots.append(("alu", ("+", addr0, self.scratch["forest_values_p"], c3)))
             slots.append(("alu", ("+", addr1, self.scratch["forest_values_p"], c4)))
@@ -772,36 +848,174 @@ class KernelBuilder:
             slots.append(("valu", ("vbroadcast", v_t4, ts4)))
             slots.append(("valu", ("vbroadcast", v_t5, ts5)))
             slots.append(("valu", ("vbroadcast", v_t6, ts6)))
-            # Process 4 vectors at a time with multiply_add for hash
-            for v in range(0, n_vecs, 4):
-                vi0, vv0 = all_idx + v * VLEN, all_val + v * VLEN
-                vi1, vv1 = all_idx + (v+1) * VLEN, all_val + (v+1) * VLEN
-                vi2, vv2 = all_idx + (v+2) * VLEN, all_val + (v+2) * VLEN
-                vi3, vv3 = all_idx + (v+3) * VLEN, all_val + (v+3) * VLEN
-                # Vselect for tree lookup - 2 pairs at a time (flow slot limited)
-                emit_vselect_lookup_pair(vi0, vi1, v_node_val, v_nv1)
-                emit_vselect_lookup_pair(vi2, vi3, v_nv2, v_nv3)
-                # XOR
-                slots.append(("valu", ("^", vv0, vv0, v_node_val)))
-                slots.append(("valu", ("^", vv1, vv1, v_nv1)))
-                slots.append(("valu", ("^", vv2, vv2, v_nv2)))
-                slots.append(("valu", ("^", vv3, vv3, v_nv3)))
-                # Hash and idx update with multiply_add
-                emit_hash_quad(vv0, vv1, vv2, vv3)
-                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, check_wrap=False)
+            # Process 8 vectors at a time for better VALU packing
+            for v in range(0, n_vecs, 8):
+                idx_vecs = [all_idx + (v+i) * VLEN for i in range(8)]
+                val_vecs = [all_val + (v+i) * VLEN for i in range(8)]
+                # Vselect for tree lookup - store in v_nv[0:8]
+                emit_vselect_lookup_pair(idx_vecs[0], idx_vecs[1], v_nv[0], v_nv[1])
+                emit_vselect_lookup_pair(idx_vecs[2], idx_vecs[3], v_nv[2], v_nv[3])
+                emit_vselect_lookup_pair(idx_vecs[4], idx_vecs[5], v_nv[4], v_nv[5])
+                emit_vselect_lookup_pair(idx_vecs[6], idx_vecs[7], v_nv[6], v_nv[7])
+                for i in range(8):
+                    slots.append(("valu", ("^", val_vecs[i], val_vecs[i], v_nv[i])))
+                emit_hash_octet(val_vecs)
+                emit_idx_octet(idx_vecs, val_vecs, check_wrap=False)
 
         # Trace: scatter start
         slots.append(("load", ("const", trace_marker, TRACE_SCATTER_START)))
         slots.append(("flow", ("trace_write", trace_marker)))
 
-        # Emit ALL scatter-section rounds together for global scheduling
-        # Rounds 3-9: scatter (no wrap check needed, idx < n_nodes)
-        for rnd in range(3, 10):
+        # Emit scatter rounds 3-10 with inter-round pipelining
+        # Key insight: round r+1's addr[q] only depends on round r's compute[q]
+        # So we can start round r+1's addr while round r's later quads process
+
+        def collect_scatter_round_ops(check_wrap):
+            """Collect all ops for a scatter round, grouped by quad and type."""
+            n_quads = n_vecs // 4
+            all_addr_ops = []
+            all_load_ops = []
+            all_compute_ops = []
+
+            for q in range(n_quads):
+                addr_ops = []
+                load_ops = []
+                v_start = q * 4
+                banks = addr_banks_even if (q % 2) == 0 else addr_banks_odd
+                for v_offset in range(4):
+                    v = v_start + v_offset
+                    bank = banks[v_offset]
+                    vi = all_idx + v * VLEN
+                    tree_dest = all_tree + v * VLEN
+                    for i in range(8):
+                        addr_ops.append(("alu", ("+", bank[i], self.scratch["forest_values_p"], vi + i)))
+                    for i in range(8):
+                        load_ops.append(("load", ("load", tree_dest + i, bank[i])))
+                all_addr_ops.append(addr_ops)
+                all_load_ops.append(load_ops)
+
+            for q in range(n_quads):
+                v_start = q * 4
+                compute_ops = []
+                vi0, vv0, tv0 = all_idx + v_start * VLEN, all_val + v_start * VLEN, all_tree + v_start * VLEN
+                vi1, vv1, tv1 = all_idx + (v_start+1) * VLEN, all_val + (v_start+1) * VLEN, all_tree + (v_start+1) * VLEN
+                vi2, vv2, tv2 = all_idx + (v_start+2) * VLEN, all_val + (v_start+2) * VLEN, all_tree + (v_start+2) * VLEN
+                vi3, vv3, tv3 = all_idx + (v_start+3) * VLEN, all_val + (v_start+3) * VLEN, all_tree + (v_start+3) * VLEN
+                compute_ops.append(("valu", ("^", vv0, vv0, tv0)))
+                compute_ops.append(("valu", ("^", vv1, vv1, tv1)))
+                compute_ops.append(("valu", ("^", vv2, vv2, tv2)))
+                compute_ops.append(("valu", ("^", vv3, vv3, tv3)))
+                emit_hash_quad(vv0, vv1, vv2, vv3, target=compute_ops)
+                emit_idx_quad(vi0, vv0, vi1, vv1, vi2, vv2, vi3, vv3, target=compute_ops, check_wrap=check_wrap)
+                all_compute_ops.append(compute_ops)
+
+            return all_addr_ops, all_load_ops, all_compute_ops
+
+        # Collect ops for all scatter rounds (3-10)
+        scatter_rounds_ops = []
+        for rnd in range(3, 11):
             if rnd < rounds:
-                emit_scatter_round(check_wrap=False)
-        # Round 10: scatter WITH wrap check (first round where idx >= n_nodes possible)
-        if 10 < rounds:
-            emit_scatter_round(check_wrap=True)
+                check_wrap = (rnd == 10)  # Only round 10 needs wrap check
+                scatter_rounds_ops.append(collect_scatter_round_ops(check_wrap))
+
+        n_scatter = len(scatter_rounds_ops)
+        n_quads = n_vecs // 4
+
+        if n_scatter > 0:
+            # Emit with inter-round pipelining
+            # Phase structure per round: addr[0], (addr[1]+load[0]), (addr[2]+load[1]+compute[0]), ...
+            # Inter-round: once compute[q] finishes for round r, start addr[q] for round r+1
+
+            # Round 0, Phase 0: just addr[0]
+            for op in scatter_rounds_ops[0][0][0]:  # round 0, addr_ops, quad 0
+                slots.append(op)
+
+            # Now do interleaved phases
+            # We track: current quad being addressed, loaded, computed for each active round
+            # Simplified approach: emit round-by-round but overlap addr of next round with compute of current
+
+            for rnd_idx in range(n_scatter):
+                addr_ops, load_ops, compute_ops = scatter_rounds_ops[rnd_idx]
+
+                # Phase 1: load[0] + addr[1] (addr[0] was done in previous phase)
+                if rnd_idx == 0:
+                    # First round - normal phase 1
+                    ai, li = 0, 0
+                    while ai < len(addr_ops[1]) or li < len(load_ops[0]):
+                        for _ in range(2):
+                            if li < len(load_ops[0]):
+                                slots.append(load_ops[0][li])
+                                li += 1
+                        for _ in range(2):
+                            if ai < len(addr_ops[1]):
+                                slots.append(addr_ops[1][ai])
+                                ai += 1
+                else:
+                    # Later rounds - addr[0] was already done in previous round's drain
+                    # Do addr[1] + load[0]
+                    ai, li = 0, 0
+                    while ai < len(addr_ops[1]) or li < len(load_ops[0]):
+                        for _ in range(2):
+                            if li < len(load_ops[0]):
+                                slots.append(load_ops[0][li])
+                                li += 1
+                        for _ in range(2):
+                            if ai < len(addr_ops[1]):
+                                slots.append(addr_ops[1][ai])
+                                ai += 1
+
+                # Phases 2 to n_quads-1: full triple pipeline
+                for q in range(2, n_quads):
+                    ai, li, ci = 0, 0, 0
+                    a_ops = addr_ops[q]
+                    l_ops = load_ops[q-1]
+                    c_ops = compute_ops[q-2]
+
+                    while ai < len(a_ops) or li < len(l_ops) or ci < len(c_ops):
+                        for _ in range(2):
+                            if li < len(l_ops):
+                                slots.append(l_ops[li])
+                                li += 1
+                        for _ in range(6):
+                            if ci < len(c_ops):
+                                slots.append(c_ops[ci])
+                                ci += 1
+                        for _ in range(2):
+                            if ai < len(a_ops):
+                                slots.append(a_ops[ai])
+                                ai += 1
+
+                # Phase n_quads: load[n_quads-1] + compute[n_quads-2]
+                li, ci = 0, 0
+                l_ops = load_ops[n_quads-1]
+                c_ops = compute_ops[n_quads-2]
+                while li < len(l_ops) or ci < len(c_ops):
+                    for _ in range(2):
+                        if li < len(l_ops):
+                            slots.append(l_ops[li])
+                            li += 1
+                    for _ in range(6):
+                        if ci < len(c_ops):
+                            slots.append(c_ops[ci])
+                            ci += 1
+
+                # Drain phase: compute[n_quads-1] + (if not last round) next_round.addr[0]
+                c_ops = compute_ops[n_quads-1]
+                next_addr_ops = None
+                if rnd_idx + 1 < n_scatter:
+                    next_addr_ops = scatter_rounds_ops[rnd_idx + 1][0][0]  # next round's addr[0]
+
+                ci, nai = 0, 0
+                while ci < len(c_ops) or (next_addr_ops and nai < len(next_addr_ops)):
+                    for _ in range(6):
+                        if ci < len(c_ops):
+                            slots.append(c_ops[ci])
+                            ci += 1
+                    if next_addr_ops:
+                        for _ in range(2):
+                            if nai < len(next_addr_ops):
+                                slots.append(next_addr_ops[nai])
+                                nai += 1
 
         # Round 11: broadcast (all idx wrapped to 0)
         if 11 < rounds:
@@ -831,11 +1045,27 @@ class KernelBuilder:
         slots.append(("load", ("const", trace_marker, TRACE_STORE_START)))
         slots.append(("flow", ("trace_write", trace_marker)))
 
-        # === STORE all val back to memory ===
+        # === STORE all val back to memory - optimized ===
+        # Compute all 32 store addresses first (can pack at 12 alu/cycle)
+        store_addrs = []
+        for v in range(n_vecs):
+            if v < 8:
+                store_addrs.append(addrs[v])
+            elif v < 16:
+                store_addrs.append(addrs_bank1[v - 8])
+            elif v < 24:
+                store_addrs.append(addrs_bank2[v - 16])
+            else:
+                store_addrs.append(addrs_bank3[v - 24])
+
+        # Compute all addresses (12 alu/cycle = 3 cycles for 32 ops)
         for v in range(n_vecs):
             off = self.scratch_const(VLEN * v)
-            slots.append(("alu", ("+", addr1, self.scratch["inp_values_p"], off)))
-            slots.append(("store", ("vstore", addr1, all_val + v * VLEN)))
+            slots.append(("alu", ("+", store_addrs[v], self.scratch["inp_values_p"], off)))
+
+        # Do all vstores (2 store/cycle = 16 cycles)
+        for v in range(n_vecs):
+            slots.append(("store", ("vstore", store_addrs[v], all_val + v * VLEN)))
 
         # Trace: all done
         slots.append(("load", ("const", trace_marker, TRACE_ALL_DONE)))
